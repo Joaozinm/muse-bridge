@@ -81,7 +81,22 @@ tailnet de um único usuário.
 ## Atualizar / desinstalar
 
 Atualizar: `git pull` na pasta e reiniciar a tarefa (ou só aguardar o
-próximo logon). Desinstalar:
+próximo logon). Reiniciar a tarefa — o cmdlet `Restart-ScheduledTask`
+NÃO existe neste PowerShell; use Stop + Start:
+
+```powershell
+Stop-ScheduledTask -TaskName MuseBridge
+Start-ScheduledTask -TaskName MuseBridge
+```
+
+Se o restart for feito pelo próprio Claude Code, ele precisa agendar
+destacado com atraso (senão o `Stop` mata o turno antes do `Start`):
+
+```powershell
+Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 20; Stop-ScheduledTask -TaskName MuseBridge; Start-ScheduledTask -TaskName MuseBridge' -WindowStyle Hidden
+```
+
+Desinstalar:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File Install.ps1 -Uninstall
