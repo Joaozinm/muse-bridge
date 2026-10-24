@@ -60,7 +60,7 @@ Screenshots são usados só para depurar o trabalho do agente.
 | Rota | Uso |
 |---|---|
 | `GET /health` | servidor vivo? sessão viva? |
-| `GET /status` | sessão, eventos, pendências, uptime |
+| `GET /status` | sessão, eventos, pendências, uptime, repo atual |
 | `POST /send` | `{"text": "..."}` → manda tarefa |
 | `GET /events` | `?since=N&timeout=S` → long-poll de eventos |
 | `GET /transcript` | página ao vivo |
@@ -69,6 +69,7 @@ Screenshots são usados só para depurar o trabalho do agente.
 | `GET /screenshot` | PNG da tela principal |
 | `GET /logs` | `?lines=N` → logs |
 | `POST /restart` | reinicia a sessão do Claude |
+| `POST /switch-repo` | `{"path": "..."}` → troca o repo (reinicia a sessão com o novo cwd). A esteira usa isso para atender vários projetos com uma só ponte, um de cada vez. |
 
 ## Segurança (decisão deliberada)
 
