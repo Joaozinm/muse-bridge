@@ -10,7 +10,7 @@
     powershell -ExecutionPolicy Bypass -File Install.ps1 [-RepoDir C:\projects\nootrieapp] [-PythonExe python]
     powershell -ExecutionPolicy Bypass -File Install.ps1 -Uninstall
   Licao v6 (nao quebrar): NUNCA usar $ErrorActionPreference = "Stop" neste
-  script — com "Stop", qualquer stderr de comando nativo vira erro fatal e
+  script - com "Stop", qualquer stderr de comando nativo vira erro fatal e
   nenhum redirect salva. Usar "Continue" + checagem explicita de $LASTEXITCODE.
 #>
 param(
@@ -99,7 +99,7 @@ try {
   $h = Invoke-WebRequest -Uri "http://${ip}:8000/health" -TimeoutSec 10 -UseBasicParsing
   Write-Host "OK: $($h.Content)"
 } catch {
-  Write-Host "AVISO: /health ainda nao respondeu — aguarde alguns segundos e abra http://${ip}:8000/transcript"
+  Write-Host "AVISO: /health ainda nao respondeu - aguarde alguns segundos e abra http://${ip}:8000/transcript"
 }
 
 Write-Host ""
