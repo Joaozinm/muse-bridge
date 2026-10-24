@@ -39,12 +39,25 @@ if ($Uninstall) {
 Write-Host "== Instalando MuseBridge (v2) =="
 Write-Host "Pasta: $InstallDir"
 
-# 1. Python?
-& $PythonExe --version 2>$null | Out-Null
-if ($LASTEXITCODE -ne 0) {
-  Write-Host "ERRO: Python nao encontrado como '$PythonExe'. Instale o Python 3 e rode de novo."
+# 1. Python (caminho COMPLETO - a tarefa agendada nao resolve "python" do
+# PATH igual ao terminal; e o atalho da Microsoft Store falha sem janela)
+$pyCmd = Get-Command $PythonExe -ErrorAction SilentlyContinue
+if (-not $pyCmd) {
+  Write-Host "ERRO: Python nao encontrado como '$PythonExe'."
   exit 1
 }
+$pythonPath = $pyCmd.Source
+& $pythonPath --version 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) {
+  Write-Host "ERRO: '$pythonPath' nao executa."
+  exit 1
+}
+if ($pythonPath -like "*WindowsApps*") {
+  Write-Host "AVISO: esse 'python' e o atalho da Microsoft Store, que falha em tarefa agendada."
+  Write-Host "Instale o Python de python.org ou passe o caminho completo com -PythonExe."
+  exit 1
+}
+Write-Host "Python: $pythonPath"
 
 # 2. IP Tailscale (o servidor escuta SOMENTE nele)
 $ip = $null
@@ -80,7 +93,7 @@ try {
 # 4. Cria (ou recria) a tarefa agendada
 Write-Host "-- criando tarefa agendada '$TaskName' ..."
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-$action = New-ScheduledTaskAction -Execute $PythonExe `
+$action = New-ScheduledTaskAction -Execute $pythonPath `
   -Argument "`"$ServerPy`" `"$RepoDir`" $ip" -WorkingDirectory $InstallDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet -RestartCount 3 `
