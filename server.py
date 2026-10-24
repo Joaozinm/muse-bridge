@@ -12,7 +12,7 @@ Env:  CLAUDE_EXE  (padrao: ~/.local/bin/claude.exe)
 
 Endpoints:
   GET  /health                       -> {"ok":true,"session":"alive"|"dead",...}
-  GET  /status                       -> {"alive":...,"session_id":...,"pending":N,...}
+  GET  /status                       -> {"alive":...,"session_id":...,"pending":N,"repo":...}
   POST /send        {"text": "..."}  -> {"ok":true,"after_seq":N}
   GET  /events?since=N&timeout=S     -> {"events":[...]} (long-poll)
   GET  /transcript                   -> pagina com a transcricao ao vivo
@@ -21,6 +21,10 @@ Endpoints:
   GET  /screenshot                   -> PNG da tela principal
   GET  /logs?lines=N                 -> {"server": [...], "stderr": [...]}
   POST /restart                      -> mata o claude e comeca sessao nova
+  POST /switch-repo {"path": "..."}  -> troca o repo (reinicia a sessao com
+                                        cwd novo). A esteira usa isso para
+                                        atender varios projetos com uma so
+                                        ponte, um de cada vez.
 
 Como a Muse aprova coisas (o ponto central da v2):
   Quando o Claude Code (ou um servidor MCP, ex.: o do Supabase) precisa de
@@ -470,7 +474,8 @@ class Handler(BaseHTTPRequestHandler):
             up = round(time.time() - session_start_ts, 1) if session_start_ts else 0
             return self._json({"alive": claude_alive(), "session_id": session_id,
                                "events": n, "last_seq": last, "uptime_s": up,
-                               "pending": len(pending_snapshot())})
+                               "pending": len(pending_snapshot()),
+                               "repo": REPO_DIR})
 
         if u.path == "/events":
             try:
@@ -556,6 +561,18 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/restart":
             restart_claude()
             return self._json({"ok": True,
+                               "session": "alive" if claude_alive() else "dead"})
+
+        if u.path == "/switch-repo":
+            global REPO_DIR
+            path = data.get("path", "")
+            if not path or not isinstance(path, str) or not os.path.isdir(path):
+                return self._json({"ok": False,
+                                   "error": "diretorio invalido"}, 400)
+            REPO_DIR = os.path.abspath(path)
+            log("repo trocado para %s" % REPO_DIR)
+            restart_claude()
+            return self._json({"ok": True, "repo": REPO_DIR,
                                "session": "alive" if claude_alive() else "dead"})
 
         return self._json({"error": "not found"}, 404)
