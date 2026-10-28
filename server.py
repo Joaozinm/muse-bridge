@@ -240,8 +240,9 @@ def send_to_claude(text):
 def respond_to_control(request_id, response):
     """Responde um control_request (ex.: aprovacao do MCP)."""
     ok = write_to_claude({"type": "control_response",
-                          "request_id": request_id,
-                          "response": response})
+                          "response": {"subtype": "success",
+                                       "request_id": request_id,
+                                       "response": response}})
     if ok:
         with pending_lock:
             pending.pop(request_id, None)
