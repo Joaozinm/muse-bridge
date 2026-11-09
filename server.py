@@ -7,6 +7,7 @@ sem endpoints legados: o stream de eventos e a unica fonte de verdade.
 
 Uso:  python server.py [REPO_DIR] [BIND_IP]
 Env:  CLAUDE_EXE  (padrao: ~/.local/bin/claude.exe)
+      BRIDGE_PORT (padrao: 8000)
       BRIDGE_DIR  (padrao: ~/.muse-bridge)
       PYTHONUTF8=1
 
@@ -20,6 +21,8 @@ Endpoints:
   POST /respond {"request_id": "...", "response": {...}} -> {"ok":true}
   GET  /screenshot                   -> PNG da tela principal
   GET  /logs?lines=N                 -> {"server": [...], "stderr": [...]}
+  GET  /turns                        -> {"turns":[...]} ultimos turnos concluidos,
+                                        com as permissoes negadas de cada um
   POST /restart                      -> mata o claude e comeca sessao nova
   POST /switch-repo {"path": "..."}  -> troca o repo (reinicia a sessao com
                                         cwd novo). A esteira usa isso para
@@ -48,10 +51,11 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-PORT = 8000
+PORT = int(os.environ.get("BRIDGE_PORT", "8000"))
 REPO_DIR = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
 BIND_IP = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
 CLAUDE_EXE = os.environ.get(
@@ -143,6 +147,177 @@ def pending_snapshot():
         return [dict(v) for v in pending.values()]
 
 
+# ---------------- permissoes negadas por turno ----------------
+# Em headless ninguem responde um pedido de permissao: o CLI nega a chamada e
+# o turno pode terminar como "success" mesmo assim. O evento `result` traz
+# `permission_denials` (lista; no CLI 2.1.319 cada item e
+# {"tool_name","tool_use_id","tool_input"}). O formato do item nao e garantido,
+# entao ele e tratado de forma generica e guardado inteiro.
+MAX_TURNS = 20
+turns = []
+turns_lock = threading.Lock()
+
+
+def summarize_denial(item):
+    """Uma linha legivel por negacao, sem assumir o formato do item."""
+    if isinstance(item, dict):
+        name = item.get("tool_name") or item.get("tool") or "?"
+        rest = {k: v for k, v in item.items() if k not in ("tool_name", "tool")}
+        return "%s %s" % (name, json.dumps(rest, ensure_ascii=False)[:300])
+    return json.dumps(item, ensure_ascii=False)[:300]
+
+
+def record_turn(ev, seq):
+    """Registra o turno concluido e suas negacoes (log + /status + /turns).
+    Nunca levanta excecao: falhar aqui nao pode derrubar o reader."""
+    raw = ev.get("permission_denials")
+    reported = isinstance(raw, list)
+    denials = raw if reported else None
+    turn = {"seq": seq, "ts": time.time(), "session_id": ev.get("session_id"),
+            "subtype": ev.get("subtype"), "is_error": ev.get("is_error"),
+            "denials_reported": reported, "permission_denials": denials,
+            "denials_count": len(denials) if reported else None}
+    if not reported:
+        log("permissoes negadas: NAO REPORTADO pelo CLI (campo %s; seq=%s)"
+            % ("ausente" if raw is None else "com formato inesperado: %s"
+               % json.dumps(raw, ensure_ascii=False)[:200], seq))
+    elif denials:
+        log("!!! PERMISSOES NEGADAS NO TURNO: %d (seq=%s, status=%s) - ver /turns"
+            % (len(denials), seq, ev.get("subtype")))
+        for i, item in enumerate(denials, 1):
+            log("!!!   negacao %d/%d: %s" % (i, len(denials), summarize_denial(item)))
+    else:
+        log("permissoes negadas: 0 (seq=%s)" % seq)
+    with turns_lock:
+        turns.append(turn)
+        del turns[:-MAX_TURNS]
+    return turn
+
+
+def turns_snapshot():
+    with turns_lock:
+        return [dict(t) for t in turns]
+
+
+# ---------------- validade do login ----------------
+# `claude auth status` traz `loginExpiresAt` (CLI >= 2.1.318) e o evento
+# `result` traz `credential_expires_at`. Antes de cada turno o login e
+# checado: expirado (ou deslogado) bloqueia o turno; perto de expirar so avisa.
+LOGIN_WARN_DAYS = 10
+LOGIN_CHECK_TTL = 300  # s entre chamadas ao `claude auth status`
+login_lock = threading.Lock()
+login_state = {"status": "unknown", "expires_at": None, "days_left": None,
+               "logged_in": None, "source": None, "checked_at": None,
+               "error": None}
+
+
+def parse_iso(s):
+    """ISO 8601 (com 'Z') -> epoch. None se nao der para interpretar."""
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.timestamp()
+
+
+def classify_login(logged_in, expires_at, now=None):
+    """-> (status, days_left). status: ok | warning | expired | logged_out | unknown"""
+    if logged_in is False:
+        return "logged_out", None
+    exp = parse_iso(expires_at)
+    if exp is None:
+        return "unknown", None
+    days = (exp - (now if now is not None else time.time())) / 86400.0
+    if days <= 0:
+        return "expired", round(days, 2)
+    if days < LOGIN_WARN_DAYS:
+        return "warning", round(days, 2)
+    return "ok", round(days, 2)
+
+
+def _set_login(logged_in, expires_at, source, error=None):
+    status, days = classify_login(logged_in, expires_at)
+    with login_lock:
+        login_state.update({"status": status, "expires_at": expires_at,
+                            "days_left": days, "logged_in": logged_in,
+                            "source": source, "checked_at": time.time(),
+                            "error": error})
+        return dict(login_state)
+
+
+def query_auth_status():
+    """Roda `claude auth status --json`. -> (logged_in, loginExpiresAt, erro).
+    So os campos necessarios saem daqui (a saida tem o e-mail da conta)."""
+    try:
+        r = subprocess.run([CLAUDE_EXE, "auth", "status", "--json"],
+                           capture_output=True, text=True, timeout=30,
+                           encoding="utf-8", errors="replace")
+        data = json.loads(r.stdout or "{}")
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        return None, None, "auth status falhou: %s" % e
+    if not isinstance(data, dict):
+        return None, None, "auth status: saida inesperada"
+    exp = data.get("loginExpiresAt")
+    err = None if exp else "auth status sem loginExpiresAt (CLI < 2.1.318?)"
+    return data.get("loggedIn"), exp, err
+
+
+def check_login(force=False):
+    """Estado atual do login. Reconsulta o CLI se o cache venceu, se pedido,
+    ou se o ultimo estado nao era ok/warning (ex.: re-login depois de expirar)."""
+    with login_lock:
+        st = dict(login_state)
+    fresh = (st["checked_at"] is not None
+             and time.time() - st["checked_at"] < LOGIN_CHECK_TTL
+             and st["status"] in ("ok", "warning"))
+    if fresh and not force:
+        # reclassifica contra o relogio atual sem chamar o CLI de novo
+        st = _set_login(st["logged_in"], st["expires_at"], st["source"], st["error"])
+    else:
+        logged_in, exp, err = query_auth_status()
+        st = _set_login(logged_in, exp, "auth status", err)
+    report_login(st)
+    return st
+
+
+_last_login_log = {"key": None}
+
+
+def report_login(st):
+    """Loga o estado do login de forma visivel (sem repetir o mesmo 'ok')."""
+    s = st["status"]
+    if s == "warning":
+        log("!!! AVISO LOGIN: expira em %.1f dias (%s). Renove com `claude login`."
+            % (st["days_left"], st["expires_at"]))
+    elif s == "expired":
+        log("!!! LOGIN EXPIRADO em %s - turnos bloqueados ate novo `claude login`"
+            % st["expires_at"])
+    elif s == "logged_out":
+        log("!!! CLAUDE DESLOGADO - turnos bloqueados ate `claude login`")
+    else:
+        key = (s, st["expires_at"], st["error"])
+        if key != _last_login_log["key"]:
+            log("login: %s (expira=%s)%s" % (s, st["expires_at"],
+                ("; " + st["error"]) if st["error"] else ""))
+    _last_login_log["key"] = (s, st["expires_at"], st["error"])
+
+
+def login_from_result(ev):
+    """Atualiza a validade conhecida com o `credential_expires_at` do result."""
+    exp = ev.get("credential_expires_at")
+    if not exp:
+        return
+    with login_lock:
+        same = login_state["expires_at"] == exp
+        logged_in = login_state["logged_in"]
+    if not same:
+        report_login(_set_login(logged_in, exp, "result.credential_expires_at"))
+
+
 # ---------------- processo claude persistente ----------------
 claude_proc = None
 claude_lock = threading.Lock()
@@ -212,6 +387,11 @@ def reader_loop():
                 log("turno concluido: status=%s dur=%sms"
                     % ("done" if subtype == "success" else "error",
                        ev.get("duration_ms", 0)))
+                try:
+                    record_turn(ev, seq)
+                    login_from_result(ev)
+                except Exception as e:  # registro nunca derruba o reader
+                    log("falha ao registrar o turno (seq=%s): %s" % (seq, e))
     except Exception as e:
         log("reader encerrou: %s" % e)
     log("reader: stdout do claude fechou (sessao morta?)")
@@ -338,6 +518,9 @@ header h1{font-size:15px;margin:0;font-weight:600}
 details.tool{margin:6px 0;font-size:13px;color:#9aa3b2}
 details.tool summary{cursor:pointer}
 .rmeta{font-size:12px;color:#8b93a5;margin-bottom:6px}
+.deny{background:#2a2110;border:1px solid #8a6d1f;border-radius:8px;padding:6px 8px;margin:0 0 8px;font-size:13px}
+.deny b{color:#f0c44c}
+.deny pre{white-space:pre-wrap;font-size:12px;color:#d8c58a;margin:4px 0 0}
 .empty{color:#8b93a5;text-align:center;margin-top:40px;font-size:14px}
 </style>
 </head>
@@ -379,8 +562,11 @@ function render(ev){
   }else if(t==='result'){
     var ok=(ev.subtype||'success')==='success';
     var meta='dura&ccedil;&atilde;o '+Math.round((ev.duration_ms||0)/1000)+'s'+(ev.total_cost_usd?' &middot; $'+Number(ev.total_cost_usd).toFixed(2):'');
+    var pd=ev.permission_denials, den='';
+    if(!Array.isArray(pd))den='<div class="rmeta">permiss&otilde;es negadas: n&atilde;o reportado</div>';
+    else if(pd.length)den='<div class="deny"><b>&#9888; '+pd.length+' permiss&atilde;o(&otilde;es) negada(s)</b><pre>'+fmt(JSON.stringify(pd,null,1).slice(0,1200))+'</pre></div>';
     addMsg(ok?'result-ok':'result-err','Resultado '+(ok?'&#10003;':'&#10007;'),
-      '<div class="rmeta">'+meta+'</div><p>'+fmt(ev.result||'(sem texto)')+'</p>',ev.ts);
+      '<div class="rmeta">'+meta+'</div>'+den+'<p>'+fmt(ev.result||'(sem texto)')+'</p>',ev.ts);
   }else if(t==='system'&&(ev.subtype==='init'||ev.subtype==='restart')){
     addMsg('sys','Sistema',ev.subtype==='init'?'Sess&atilde;o iniciada &middot; <code>'+esc(ev.session_id||'')+'</code>':'Sess&atilde;o reiniciada',ev.ts);
   }else if(t==='control_request'){
@@ -401,7 +587,7 @@ async function poll(){
 async function status(){
   try{
     var r=await fetch('/status'); var s=await r.json();
-    document.getElementById('st').textContent=(s.alive?'\u25CF sess\u00E3o viva':'\u25CB sess\u00E3o morta')+(s.session_id?' \u00B7 '+s.session_id.slice(0,8)+'\u2026':'')+(s.pending?' \u00B7 '+s.pending+' pendente(s)':'');
+    document.getElementById('st').textContent=(s.alive?'\u25CF sess\u00E3o viva':'\u25CB sess\u00E3o morta')+(s.session_id?' \u00B7 '+s.session_id.slice(0,8)+'\u2026':'')+(s.pending?' \u00B7 '+s.pending+' pendente(s)':'')+(function(l){l=l||{};if(l.status==='warning')return ' \u00B7 \u26A0 login expira em '+l.days_left+' dias';if(l.status==='expired'||l.status==='logged_out')return ' \u00B7 \u26D4 login '+l.status;return '';})(s.login);
   }catch(e){document.getElementById('st').textContent='sem conex\u00E3o';}
   setTimeout(status,10000);
 }
@@ -476,7 +662,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"alive": claude_alive(), "session_id": session_id,
                                "events": n, "last_seq": last, "uptime_s": up,
                                "pending": len(pending_snapshot()),
-                               "repo": REPO_DIR})
+                               "repo": REPO_DIR,
+                               "login": dict(login_state),
+                               "last_turn": (turns_snapshot() or [None])[-1]})
+
+        if u.path == "/turns":
+            return self._json({"turns": turns_snapshot()})
 
         if u.path == "/events":
             try:
@@ -536,6 +727,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": "text vazio"}, 400)
             if not claude_alive():
                 return self._json({"ok": False, "error": "sessao morta"}, 500)
+            login = check_login()
+            if login["status"] in ("expired", "logged_out"):
+                log("turno NAO iniciado: login %s" % login["status"])
+                return self._json({"ok": False,
+                                   "error": "login %s" % ("expirado" if login["status"] == "expired" else "ausente"),
+                                   "login": login}, 403)
             with events_lock:
                 after_seq = next_seq - 1
             if not send_to_claude(text):
@@ -544,7 +741,11 @@ class Handler(BaseHTTPRequestHandler):
             push_event({"type": "user",
                         "message": {"role": "user", "content": text}})
             log("turno iniciado (%d chars; after_seq=%d)" % (len(text), after_seq))
-            return self._json({"ok": True, "after_seq": after_seq})
+            out = {"ok": True, "after_seq": after_seq}
+            if login["status"] == "warning":
+                out["login_warning"] = ("login expira em %.1f dias (%s)"
+                                        % (login["days_left"], login["expires_at"]))
+            return self._json(out)
 
         if u.path == "/respond":
             rid = data.get("request_id", "")
@@ -588,6 +789,7 @@ def main():
     n = replay_jsonl()
     if n:
         log("historico restaurado do disco: %d eventos" % n)
+    check_login(force=True)
     spawn_claude()
     srv = ThreadingHTTPServer((BIND_IP, PORT), Handler)
     log("HTTP no ar em http://%s:%d" % (BIND_IP, PORT))
