@@ -13,8 +13,10 @@ Env:  CLAUDE_EXE  (padrao: ~/.local/bin/claude.exe)
 
 Endpoints:
   GET  /health                       -> {"ok":true,"session":"alive"|"dead",...}
-  GET  /status                       -> {"alive":...,"session_id":...,"pending":N,"repo":...}
-  POST /send        {"text": "..."}  -> {"ok":true,"after_seq":N}
+  GET  /status                       -> {"alive":...,"session_id":...,"pending":N,"repo":...,
+                                        "model":...,"model_fallback":...}
+  POST /send        {"text": "...", "model": "fable"|"opus"|<id>}  (model opcional)
+                                     -> {"ok":true,"after_seq":N,"model":...}
   GET  /events?since=N&timeout=S     -> {"events":[...]} (long-poll)
   GET  /transcript                   -> pagina com a transcricao ao vivo
   GET  /pending                      -> {"pending":[...]} (control_requests sem resposta)
@@ -318,6 +320,117 @@ def login_from_result(ev):
         report_login(_set_login(logged_in, exp, "result.credential_expires_at"))
 
 
+# ---------------- modelo por turno ----------------
+# Quem despacha marca o modelo de cada turno com `model` no /send. So os IDs
+# abaixo (e seus apelidos) chegam ao CLI; qualquer outra string e rejeitada.
+MODEL_FABLE = "claude-fable-5-2"
+MODEL_OPUS = "claude-opus-5-5"
+FALLBACK_MODEL = MODEL_OPUS
+MODEL_ALIASES = {"fable": MODEL_FABLE, "opus": MODEL_OPUS,
+                 MODEL_FABLE: MODEL_FABLE, MODEL_OPUS: MODEL_OPUS}
+MODEL_PROBE_S = float(os.environ.get("BRIDGE_MODEL_PROBE_S", "3"))
+MAX_MODEL_FAILURES = 2  # depois disso o modelo nao e mais tentado (fica no Opus)
+
+current_model = None   # o --model do processo atual (None = default do CLI)
+cli_model = None       # o modelo que o CLI informou no evento init
+model_fallback = None  # {"requested","used","reason","ts"} da ultima queda
+model_failures = {}    # modelo -> falhas de troca
+turn_in_flight = False
+switch_lock = threading.Lock()
+
+
+def resolve_model(value):
+    """-> (id_resolvido | None, erro | None). None/ausente = sem --model."""
+    if value is None:
+        return None, None
+    if not isinstance(value, str) or value not in MODEL_ALIASES:
+        return None, ("model invalido: %s (aceitos: %s)"
+                      % (json.dumps(value, ensure_ascii=False)[:80],
+                         ", ".join(sorted(MODEL_ALIASES))))
+    return MODEL_ALIASES[value], None
+
+
+def needs_model_restart(requested, current):
+    """Reinicia so quando um modelo foi pedido e ele difere do corrente."""
+    return requested is not None and requested != current
+
+
+def is_model_error(ev):
+    """O `result` de um turno que falhou por causa do modelo (ex.: 404
+    'There's an issue with the selected model' no CLI 2.1.319)."""
+    if not ev.get("is_error"):
+        return False
+    text = str(ev.get("result") or "").lower()
+    return (ev.get("api_error_status") in (403, 404)
+            or "selected model" in text)
+
+
+def _record_fallback(requested, reason):
+    global model_fallback
+    model_fallback = {"requested": requested, "used": FALLBACK_MODEL,
+                      "reason": reason, "ts": time.time()}
+    model_failures[requested] = model_failures.get(requested, 0) + 1
+    log("!!! FALLBACK DE MODELO: %s -> %s (%s; falhas=%d)"
+        % (requested, FALLBACK_MODEL, reason, model_failures[requested]))
+
+
+def switch_model(requested):
+    """Troca o modelo da sessao preservando o contexto (--resume).
+    Se o modelo pedido morrer rapido, volta para o Opus 5.5. Depois de
+    MAX_MODEL_FAILURES falhas, o modelo pedido nem e mais tentado.
+    -> o modelo efetivamente em uso."""
+    with switch_lock:
+        if not needs_model_restart(requested, current_model):
+            return current_model
+        if (requested != FALLBACK_MODEL
+                and model_failures.get(requested, 0) >= MAX_MODEL_FAILURES):
+            log("modelo %s falhou %d vezes; mantendo %s"
+                % (requested, model_failures[requested], FALLBACK_MODEL))
+            if current_model != FALLBACK_MODEL:
+                restart_claude(model=FALLBACK_MODEL, resume=session_id)
+            return FALLBACK_MODEL
+        resume = session_id
+        log("troca de modelo: %s -> %s (resume=%s)"
+            % (current_model or "default", requested, resume))
+        restart_claude(model=requested, resume=resume)
+        deadline = time.time() + MODEL_PROBE_S
+        while time.time() < deadline and claude_alive():
+            time.sleep(0.1)
+        if claude_alive():
+            return requested
+        if requested == FALLBACK_MODEL:
+            log("!!! processo com %s morreu ao subir" % requested)
+            return requested
+        _record_fallback(requested, "processo morreu em < %.0fs ao subir"
+                         % MODEL_PROBE_S)
+        restart_claude(model=FALLBACK_MODEL, resume=resume)
+        return FALLBACK_MODEL
+
+
+def fallback_after_model_error(ev):
+    """Turno falhou por causa do modelo: volta para o Opus 5.5 (em thread,
+    para nao travar o reader). O turno que falhou nao e reenviado."""
+    requested = current_model
+    if requested in (None, FALLBACK_MODEL):
+        return
+    _record_fallback(requested, "turno falhou: %s"
+                     % str(ev.get("result") or "")[:200])
+
+    def run():
+        with switch_lock:
+            if current_model == requested:
+                restart_claude(model=FALLBACK_MODEL, resume=ev.get("session_id")
+                               or session_id)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def model_status():
+    return {"model": current_model or cli_model,
+            "model_requested": current_model,
+            "model_cli": cli_model,
+            "model_fallback": model_fallback}
+
+
 # ---------------- processo claude persistente ----------------
 claude_proc = None
 claude_lock = threading.Lock()
@@ -325,15 +438,24 @@ session_id = None
 session_start_ts = None
 
 
-def spawn_claude():
-    global claude_proc, session_id, session_start_ts
+def spawn_claude(model=None, resume=None):
+    global claude_proc, session_id, session_start_ts, current_model, cli_model
+    global turn_in_flight
     args = [CLAUDE_EXE,
             "--output-format", "stream-json",
             "--input-format", "stream-json",
             "--verbose",
             "--include-partial-messages",
             "--dangerously-skip-permissions"]
-    log("iniciando claude (cwd=%s)" % REPO_DIR)
+    if resume:
+        args += ["--resume", resume]
+    if model:
+        args += ["--model", model]
+    current_model = model
+    cli_model = None
+    turn_in_flight = False
+    log("iniciando claude (cwd=%s, model=%s, resume=%s)"
+        % (REPO_DIR, model or "default", resume or "-"))
     err_log = open(ERR_PATH, "a", encoding="utf-8")
     with claude_lock:
         claude_proc = subprocess.Popen(
@@ -348,7 +470,7 @@ def spawn_claude():
             errors="replace",
         )
         session_start_ts = time.time()
-    session_id = None
+    session_id = resume  # com --resume a sessao continua a mesma
     threading.Thread(target=reader_loop, daemon=True).start()
     log("claude iniciado (pid=%s)" % claude_proc.pid)
 
@@ -360,7 +482,7 @@ def claude_alive():
 
 def reader_loop():
     """Le o stdout do claude linha a linha (NDJSON) ate o processo morrer."""
-    global session_id
+    global session_id, cli_model, turn_in_flight
     proc = claude_proc
     try:
         for line in proc.stdout:
@@ -375,7 +497,9 @@ def reader_loop():
             etype = ev.get("type")
             if etype == "system" and ev.get("subtype") == "init":
                 session_id = ev.get("session_id")
-                log("sessao pronta: session_id=%s (seq=%s)" % (session_id, seq))
+                cli_model = ev.get("model") or cli_model
+                log("sessao pronta: session_id=%s model=%s (seq=%s)"
+                    % (session_id, cli_model, seq))
             elif etype == "control_request":
                 rid = ev.get("request_id", "?")
                 with pending_lock:
@@ -387,9 +511,13 @@ def reader_loop():
                 log("turno concluido: status=%s dur=%sms"
                     % ("done" if subtype == "success" else "error",
                        ev.get("duration_ms", 0)))
+                if proc is claude_proc:
+                    turn_in_flight = False
                 try:
                     record_turn(ev, seq)
                     login_from_result(ev)
+                    if proc is claude_proc and is_model_error(ev):
+                        fallback_after_model_error(ev)
                 except Exception as e:  # registro nunca derruba o reader
                     log("falha ao registrar o turno (seq=%s): %s" % (seq, e))
     except Exception as e:
@@ -430,7 +558,10 @@ def respond_to_control(request_id, response):
     return ok
 
 
-def restart_claude():
+def restart_claude(model=None, resume=None):
+    """Mata o claude e sobe outro. Sem `model`, mantem o modelo corrente."""
+    if model is None:
+        model = current_model
     log("reiniciando sessao do claude...")
     with claude_lock:
         p = claude_proc
@@ -445,7 +576,7 @@ def restart_claude():
                 pass
     with pending_lock:
         pending.clear()
-    spawn_claude()
+    spawn_claude(model=model, resume=resume)
 
 
 # ---------------- screenshot (debug visual) ----------------
@@ -664,7 +795,8 @@ class Handler(BaseHTTPRequestHandler):
                                "pending": len(pending_snapshot()),
                                "repo": REPO_DIR,
                                "login": dict(login_state),
-                               "last_turn": (turns_snapshot() or [None])[-1]})
+                               "last_turn": (turns_snapshot() or [None])[-1],
+                               **model_status()})
 
         if u.path == "/turns":
             return self._json({"turns": turns_snapshot()})
@@ -711,6 +843,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"error": "not found"}, 404)
 
     def do_POST(self):
+        global turn_in_flight
         u = urlparse(self.path)
         try:
             n = int(self.headers.get("Content-Length", 0))
@@ -725,7 +858,11 @@ class Handler(BaseHTTPRequestHandler):
             text = data.get("text", "")
             if not text or not isinstance(text, str):
                 return self._json({"ok": False, "error": "text vazio"}, 400)
-            if not claude_alive():
+            requested, err = resolve_model(data.get("model"))
+            if err:
+                return self._json({"ok": False, "error": err}, 400)
+            switching = needs_model_restart(requested, current_model)
+            if not switching and not claude_alive():
                 return self._json({"ok": False, "error": "sessao morta"}, 500)
             login = check_login()
             if login["status"] in ("expired", "logged_out"):
@@ -733,15 +870,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False,
                                    "error": "login %s" % ("expirado" if login["status"] == "expired" else "ausente"),
                                    "login": login}, 403)
+            if switching:
+                if turn_in_flight and claude_alive():
+                    return self._json({"ok": False, "error":
+                                       "turno em andamento; troca de modelo so "
+                                       "entre turnos"}, 409)
+                switch_model(requested)
+                if not claude_alive():
+                    return self._json({"ok": False, "error": "sessao morta",
+                                       **model_status()}, 500)
             with events_lock:
                 after_seq = next_seq - 1
             if not send_to_claude(text):
                 return self._json({"ok": False,
                                    "error": "falha ao escrever no claude"}, 500)
+            turn_in_flight = True
             push_event({"type": "user",
                         "message": {"role": "user", "content": text}})
-            log("turno iniciado (%d chars; after_seq=%d)" % (len(text), after_seq))
-            out = {"ok": True, "after_seq": after_seq}
+            log("turno iniciado (%d chars; after_seq=%d; model=%s)"
+                % (len(text), after_seq, current_model or "default"))
+            out = {"ok": True, "after_seq": after_seq, **model_status()}
             if login["status"] == "warning":
                 out["login_warning"] = ("login expira em %.1f dias (%s)"
                                         % (login["days_left"], login["expires_at"]))

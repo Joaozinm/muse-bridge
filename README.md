@@ -44,6 +44,35 @@ aprova o que já foi autorizado na tarefa; escala para o usuário o que é
 destrutivo/irreversível e não foi autorizado; nega o que viola regras
 permanentes (ex.: commit direto na `main`).
 
+## Modelo por turno
+
+Quem despacha escolhe o modelo de cada turno com o campo `model` do
+`/send`: planejamento em **Claude Fable 5.2**, execução em **Claude Opus 5.5**.
+
+| `model` | vira |
+|---|---|
+| `fable` ou `claude-fable-5-2` | `--model claude-fable-5-2` |
+| `opus` ou `claude-opus-5-5` | `--model claude-opus-5-5` |
+| ausente / `null` | nada muda (sem `model`, o processo segue como está; no boot, default do CLI) |
+| qualquer outra coisa | `400 model invalido` — a string nunca chega ao CLI |
+
+- **Troca só quando muda.** Se o modelo pedido é o da sessão atual, o turno
+  vai direto. Se é outro, o servidor reinicia o `claude` com
+  `--resume <session_id> --model <id>`: mesma sessão, mesmo contexto. Sem
+  `session_id` ainda, sobe só com `--model`.
+- **Só entre turnos.** Pedir outro modelo com um turno em andamento devolve
+  `409` (reiniciar ali mataria o turno e as aprovações pendentes).
+- **Fallback.** Se o processo com o modelo pedido morre nos primeiros
+  segundos, ou o turno falha por causa do modelo (o CLI devolve `result`
+  com `is_error` e `api_error_status` 404/"selected model"), a sessão volta
+  para `claude-opus-5-5` (com `--resume`) e o motivo fica em
+  `/status.model_fallback`. O turno que falhou **não** é reenviado — quem
+  despacha vê o erro e decide. Depois de 2 falhas do mesmo modelo, ele nem é
+  mais tentado: os turnos seguem no Opus 5.5 até a ponte reiniciar.
+- `/status` traz `model` (o modelo em uso), `model_requested` (o `--model`
+  do processo; `null` = default do CLI), `model_cli` (o que o CLI informou no
+  `init`) e `model_fallback`.
+
 ## Auto-diagnóstico
 
 Quando a Muse detecta um travamento (sem eventos novos por minutos, ou
@@ -60,8 +89,8 @@ Screenshots são usados só para depurar o trabalho do agente.
 | Rota | Uso |
 |---|---|
 | `GET /health` | servidor vivo? sessão viva? |
-| `GET /status` | sessão, eventos, pendências, uptime, repo atual |
-| `POST /send` | `{"text": "..."}` → manda tarefa |
+| `GET /status` | sessão, eventos, pendências, uptime, repo atual, `model`, `model_fallback` |
+| `POST /send` | `{"text": "...", "model": "fable"}` → manda tarefa (`model` opcional, ver abaixo) |
 | `GET /events` | `?since=N&timeout=S` → long-poll de eventos |
 | `GET /transcript` | página ao vivo |
 | `GET /pending` | control_requests sem resposta |
