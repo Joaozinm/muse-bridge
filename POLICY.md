@@ -27,6 +27,25 @@ Regras permanentes do usuário valem acima de tudo.
   revisão, envio de credenciais para fora do destino autorizado.
 - Ações fora do escopo da tarefa, mesmo que pareçam inofensivas.
 
+## O que a ponte responde sozinha (antes da Muse)
+
+Pedido sem resposta trava o turno para sempre: foi o que parou a v1 e a v2
+da floresta (telemetria do `blender-community`, seq 1339774 e 1340425 do
+`events.jsonl`). Por isso a ponte tem uma tabela fixa, `ELICITATION_POLICY`
+em `server.py`, e um prazo:
+
+| Pedido | Resposta | Quando |
+|---|---|---|
+| `blender-community` + consentimento de telemetria (texto de opt-in **e** campo `consent` no formulário) | `{"action": "decline"}` | imediato (decisão do João na v3) |
+| Qualquer outro `control_request` (ex.: confirmação de SQL destrutivo do Supabase) | espera a Muse por 60 s (`BRIDGE_ELICIT_WAIT_S`) | se a Muse responder via `/respond` no prazo, vale a resposta dela |
+| O mesmo, sem resposta no prazo | elicitation → `{"action": "cancel"}`; `can_use_tool` → `deny`; outro tipo → nenhuma; **e o turno é encerrado** (`interrupt`) | decisão D3, opção B: não segue sem resposta e também não trava |
+
+Cada ação da ponte vira um evento `bridge_alert` no stream (`/events`,
+`/transcript`) e uma linha `ALERTA` no `sessao.log`. A ponte nunca reenvia
+o brief: quem despachou lê o alerta e decide.
+
+Entrar uma regra nova na tabela é decisão do João, não da Muse nem do turno.
+
 ## Como ela responde
 
 A resposta vai via `POST /respond` com o `request_id` exato do pedido e

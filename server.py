@@ -146,12 +146,146 @@ def replay_jsonl():
 
 # ---------------- control_requests pendentes ----------------
 pending = {}
+pending_deadline = {}  # request_id -> epoch em que a politica padrao (D3) age
 pending_lock = threading.Lock()
 
 
 def pending_snapshot():
     with pending_lock:
         return [dict(v) for v in pending.values()]
+
+
+def bridge_alert(kind, level, message, **extra):
+    """Alerta da propria ponte: vai para o stream (/events, /transcript) e o log.
+    level: info (a ponte resolveu sozinha) | warn (atencao) | action (a ponte agiu
+    sobre o turno: cancelou, interrompeu, encerrou)."""
+    ev = {"type": "bridge_alert", "kind": kind, "level": level,
+          "message": message}
+    ev.update(extra)
+    log("%s ALERTA [%s/%s] %s" % ("!!!" if level != "info" else "---",
+                                   level, kind, message))
+    return push_event(ev)
+
+
+# ---------------- politica de elicitation (F01) ----------------
+# Um servidor MCP pode pedir uma decisao humana (elicitation) e esperar sem
+# prazo nenhum: foi isso que travou a v1 e a v2 da floresta (telemetria do
+# blender-community, seq 1339774 e 1340425). A ponte responde sozinha o que a
+# tabela conhece; o resto espera a Muse por ELICIT_WAIT_S e, sem resposta,
+# e cancelado e o turno e encerrado (decisao D3, opcao B, do Joao).
+ELICIT_WAIT_S = float(os.environ.get("BRIDGE_ELICIT_WAIT_S", "60"))
+
+ELICITATION_POLICY = [
+    {"id": "blender-telemetria",
+     "server": "blender-community",
+     # texto real do consent_prompt do mcp-for-blender 2.2.7 ("...collect data
+     # from this session to help improve the tool... Opt in?")
+     "message_any": ("collect data", "help improve", "opt in", "telemetry"),
+     "schema_any": ("consent",),
+     "response": {"action": "decline"},
+     "why": "consentimento de telemetria: recusa decidida pelo Joao na v3"},
+]
+
+
+def match_elicitation_policy(request):
+    """-> a regra da tabela que cobre este pedido, ou None. Pura (testavel).
+    Exige servidor igual E texto de consentimento E (se a regra pede) o campo
+    do formulario: nada de casar so pelo nome do servidor."""
+    if not isinstance(request, dict) or request.get("subtype") != "elicitation":
+        return None
+    server = request.get("mcp_server_name")
+    msg = str(request.get("message") or "").lower()
+    schema = request.get("requested_schema") or {}
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    props = props if isinstance(props, dict) else {}
+    for rule in ELICITATION_POLICY:
+        if server != rule["server"]:
+            continue
+        if not any(k in msg for k in rule["message_any"]):
+            continue
+        if rule.get("schema_any") and not any(k in props for k in rule["schema_any"]):
+            continue
+        return rule
+    return None
+
+
+def default_response(request):
+    """Resposta da politica padrao (D3) para um pedido que ninguem respondeu.
+    None = nao ha formato seguro conhecido; so o interrupt encerra o turno."""
+    subtype = (request or {}).get("subtype")
+    if subtype == "elicitation":
+        return {"action": "cancel"}
+    if subtype == "can_use_tool":
+        return {"behavior": "deny",
+                "message": "sem resposta em %.0fs; negado pela ponte" % ELICIT_WAIT_S}
+    return None
+
+
+def handle_control_request(ev, seq):
+    """Chamado pelo reader para cada control_request. Nunca levanta."""
+    rid = ev.get("request_id", "?")
+    req = ev.get("request") or {}
+    with pending_lock:
+        pending[rid] = ev
+    rule = match_elicitation_policy(req)
+    if rule:
+        ok = respond_to_control(rid, rule["response"])
+        bridge_alert("elicitation_auto", "info",
+                     "elicitation de %s respondida pela politica '%s': %s"
+                     % (req.get("mcp_server_name"), rule["id"],
+                        json.dumps(rule["response"])),
+                     request_id=rid, rule=rule["id"], response=rule["response"],
+                     ok=ok, request_seq=seq)
+        if not ok:  # nao conseguiu escrever: cai no prazo padrao
+            with pending_lock:
+                pending_deadline[rid] = time.time() + ELICIT_WAIT_S
+        return
+    with pending_lock:
+        pending_deadline[rid] = time.time() + ELICIT_WAIT_S
+    log("control_request pendente: id=%s (seq=%s) — ver /pending; sem resposta "
+        "em %.0fs a ponte cancela e encerra o turno" % (rid, seq, ELICIT_WAIT_S))
+    bridge_alert("control_request_pendente", "warn",
+                 "pedido %s de %s sem regra na politica; esperando a Muse por "
+                 "%.0fs (POST /respond)" % (req.get("subtype"),
+                                           req.get("mcp_server_name") or "claude",
+                                           ELICIT_WAIT_S),
+                 request_id=rid, request_seq=seq, wait_s=ELICIT_WAIT_S)
+
+
+def control_cancelled(ev):
+    """O CLI desistiu do pedido (control_cancel_request): sai do /pending."""
+    rid = ev.get("request_id")
+    with pending_lock:
+        had = pending.pop(rid, None) is not None
+        pending_deadline.pop(rid, None)
+    if had:
+        log("control_request cancelado pelo claude: id=%s" % rid)
+
+
+def expire_pending(now=None):
+    """Aplica a politica padrao (D3, opcao B) aos pedidos vencidos:
+    responde cancel (ou deny) e encerra o turno com interrupt."""
+    now = time.time() if now is None else now
+    with pending_lock:
+        due = [(rid, pending.get(rid)) for rid, dl in pending_deadline.items()
+               if dl <= now]
+        for rid, _ in due:
+            pending_deadline.pop(rid, None)
+    for rid, ev in due:
+        if ev is None:
+            continue
+        req = ev.get("request") or {}
+        resp = default_response(req)
+        ok = respond_to_control(rid, resp) if resp is not None else False
+        with pending_lock:
+            pending.pop(rid, None)
+        bridge_alert("control_request_expirado", "action",
+                     "pedido %s de %s sem resposta em %.0fs: %s e turno encerrado"
+                     % (req.get("subtype"), req.get("mcp_server_name") or "claude",
+                        ELICIT_WAIT_S, json.dumps(resp) if resp else "sem resposta"),
+                     request_id=rid, response=resp, ok=ok)
+        interrupt_turn("control_request %s sem resposta (D3: cancelar e encerrar)"
+                       % rid)
 
 
 # ---------------- permissoes negadas por turno ----------------
@@ -506,11 +640,13 @@ def reader_loop():
                 log("sessao pronta: session_id=%s model=%s (seq=%s)"
                     % (session_id, cli_model, seq))
             elif etype == "control_request":
-                rid = ev.get("request_id", "?")
-                with pending_lock:
-                    pending[rid] = ev
-                log("control_request pendente: id=%s (seq=%s) — ver /pending"
-                    % (rid, seq))
+                try:
+                    handle_control_request(ev, seq)
+                except Exception as e:  # politica nunca derruba o reader
+                    log("falha na politica de control_request (seq=%s): %s"
+                        % (seq, e))
+            elif etype == "control_cancel_request":
+                control_cancelled(ev)
             elif etype == "result":
                 subtype = ev.get("subtype", "success")
                 log("turno concluido: status=%s dur=%sms"
@@ -559,7 +695,25 @@ def respond_to_control(request_id, response):
     if ok:
         with pending_lock:
             pending.pop(request_id, None)
+            pending_deadline.pop(request_id, None)
         log("control_response enviado: id=%s" % request_id)
+    return ok
+
+
+_interrupt_n = [0]
+
+
+def interrupt_turn(reason):
+    """Pede ao CLI para interromper o turno atual (control_request interrupt;
+    o `init` anuncia a capacidade e o CLI 2.1.322 responde control_response
+    success). Nunca reenvia o brief."""
+    _interrupt_n[0] += 1
+    rid = "bridge-interrupt-%d-%d" % (os.getpid(), _interrupt_n[0])
+    ok = write_to_claude({"type": "control_request", "request_id": rid,
+                          "request": {"subtype": "interrupt"}})
+    bridge_alert("interrupt", "action", "interrupt enviado (%s): %s"
+                 % ("ok" if ok else "FALHOU", reason),
+                 request_id=rid, ok=ok, reason=reason)
     return ok
 
 
@@ -581,7 +735,26 @@ def restart_claude(model=None, resume=None):
                 pass
     with pending_lock:
         pending.clear()
+        pending_deadline.clear()
     spawn_claude(model=model, resume=resume)
+
+
+# ---------------- vigia (um thread, um tique por WATCH_TICK_S) ----------------
+WATCH_TICK_S = float(os.environ.get("BRIDGE_WATCH_TICK_S", "1"))
+
+
+def watchdog_tick(now=None):
+    now = time.time() if now is None else now
+    expire_pending(now)
+
+
+def watchdog_loop():
+    while True:
+        time.sleep(WATCH_TICK_S)
+        try:
+            watchdog_tick()
+        except Exception as e:  # o vigia nunca morre
+            log("vigia: erro no tique: %s" % e)
 
 
 # ---------------- screenshot (debug visual) ----------------
@@ -707,6 +880,8 @@ function render(ev){
     addMsg('sys','Sistema',ev.subtype==='init'?'Sess&atilde;o iniciada &middot; <code>'+esc(ev.session_id||'')+'</code>':'Sess&atilde;o reiniciada',ev.ts);
   }else if(t==='control_request'){
     addMsg('sys','Sistema','&#9203; Aguardando decis&atilde;o: <code>'+esc(ev.request_id||'')+'</code>',ev.ts);
+  }else if(t==='bridge_alert'){
+    addMsg(ev.level==='info'?'sys':'result-err','Ponte &middot; '+esc(ev.kind||'alerta'),fmt(ev.message||''),ev.ts);
   }
 }
 async function poll(){
@@ -1020,6 +1195,7 @@ def main():
         log("historico restaurado do disco: %d eventos" % n)
     check_login(force=True)
     spawn_claude()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
     srv = ThreadingHTTPServer((BIND_IP, PORT), Handler)
     log("HTTP no ar em http://%s:%d" % (BIND_IP, PORT))
     log("Transcricao ao vivo em http://%s:%d/transcript" % (BIND_IP, PORT))

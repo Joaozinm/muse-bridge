@@ -20,7 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SERVER = os.path.join(ROOT, "server.py")
 
 STUB = r'''
-import json, os, sys
+import json, os, sys, time
 exp = os.environ.get("STUB_EXP") or None
 if sys.argv[1:3] == ["auth", "status"]:
     d = {"loggedIn": os.environ.get("STUB_LOGGED", "1") == "1", "authMethod": "stub"}
@@ -36,11 +36,54 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "args.jsonl")
 if model and model == os.environ.get("STUB_DIE_MODEL"):
     sys.exit(1)
 sid = resume or "stub"
-print(json.dumps({"type": "system", "subtype": "init", "session_id": sid,
-                  "model": model or "stub-default"}), flush=True)
+HERE = os.path.dirname(os.path.abspath(__file__))
+def out(ev):
+    print(json.dumps(ev), flush=True)
+def note(name, obj):
+    with open(os.path.join(HERE, name), "a") as f:
+        f.write(json.dumps(obj) + "\n")
+out({"type": "system", "subtype": "init", "session_id": sid,
+     "model": model or "stub-default", "capabilities": ["interrupt_receipt_v1"]})
 mode = os.environ.get("STUB_DENIALS", "empty")
+TELEMETRY = {"subtype": "elicitation", "mcp_server_name": "blender-community",
+    "message": "Blender MCP can collect data from this session to help improve the tool: "
+               "your prompts, the code that gets generated, viewport screenshots, and scene "
+               "metadata.\n\nThis is off by default and stays off unless you turn it on. Opt in?",
+    "mode": "form", "requested_schema": {"type": "object", "properties": {"consent": {
+        "type": "boolean", "default": False}}, "required": ["consent"]}}
+UNKNOWN = {"subtype": "elicitation", "mcp_server_name": "supabase",
+    "message": "This SQL includes destructive operations. Run it on project x?",
+    "mode": "form", "requested_schema": {"type": "object", "properties": {}}}
+n_elicit = 0
 for line in sys.stdin:
     if not line.strip():
+        continue
+    msg = json.loads(line)
+    t = msg.get("type")
+    if t == "control_request" and (msg.get("request") or {}).get("subtype") == "interrupt":
+        note("interrupts.jsonl", {"ts": time.time(), "request_id": msg.get("request_id")})
+        out({"type": "control_response", "response": {"subtype": "success",
+             "request_id": msg.get("request_id"), "response": {"still_queued": []}}})
+        if os.environ.get("STUB_INTERRUPT_RESULT", "1") == "1":
+            out({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                 "duration_ms": 5, "result": "interrupted", "session_id": sid,
+                 "permission_denials": []})
+        continue
+    if t == "control_response":
+        r = msg.get("response") or {}
+        note("responses.jsonl", {"ts": time.time(), "request_id": r.get("request_id"),
+                                 "response": r.get("response")})
+        out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 5,
+             "result": "elicitation:%s" % (r.get("response") or {}).get("action"),
+             "session_id": sid, "permission_denials": []})
+        continue
+    if t != "user":
+        continue
+    elicit = os.environ.get("STUB_ELICIT")
+    if elicit:
+        n_elicit += 1
+        out({"type": "control_request", "request_id": "el-%d" % n_elicit,
+             "request": TELEMETRY if elicit == "telemetry" else UNKNOWN})
         continue
     if os.environ.get("STUB_HOLD") == "1":
         continue
@@ -86,7 +129,8 @@ def run_case(name, port, env_extra, check):
         f.write('@"%s" "%s" %%*\n' % (sys.executable, stub_py))
     env = dict(os.environ, CLAUDE_EXE=stub_cmd, BRIDGE_DIR=tmp,
                BRIDGE_PORT=str(port), PYTHONUTF8="1", BRIDGE_MODEL_PROBE_S="1.5",
-               **env_extra)
+               BRIDGE_WATCH_TICK_S="0.2")
+    env.update(env_extra)
     srv = subprocess.Popen([sys.executable, SERVER, tmp, "127.0.0.1"], env=env,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
@@ -252,6 +296,87 @@ def case_model_busy(port, tmp):
     assert len(spawns(tmp)) == 1, spawns(tmp)
 
 
+# ---------------- politica de elicitation (F01 / caos C1) ----------------
+def stub_log(tmp, name):
+    p = os.path.join(tmp, name)
+    if not os.path.isfile(p):
+        return []
+    with open(p) as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+
+def wait_for(fn, timeout, what):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        v = fn()
+        if v:
+            return v
+        time.sleep(0.1)
+    raise AssertionError("tempo esgotado (%ss): %s" % (timeout, what))
+
+
+def all_events(port):
+    return http(port, "/events?since=0&timeout=0")[1]["events"]
+
+
+def alerts(port):
+    return [e for e in all_events(port) if e.get("type") == "bridge_alert"]
+
+
+def case_elicit_telemetry(port, tmp):
+    t0 = time.time()
+    code, r = http(port, "/send", {"text": "probe do blender"})
+    assert code == 200, (code, r)
+    resp = wait_for(lambda: stub_log(tmp, "responses.jsonl"), 5,
+                    "resposta automatica a telemetria")
+    dt = resp[0]["ts"] - t0
+    assert dt <= 5, "decline levou %.2fs" % dt
+    assert resp[0]["request_id"] == "el-1", resp
+    assert resp[0]["response"] == {"action": "decline"}, resp
+    st = wait_turn(port)
+    assert st["last_turn"]["subtype"] == "success", st
+    assert http(port, "/pending")[1]["pending"] == [], "pendente sobrou"
+    assert st["pending"] == 0, st
+    kinds = [a["kind"] for a in alerts(port)]
+    assert "elicitation_auto" in kinds, kinds
+    assert not stub_log(tmp, "interrupts.jsonl"), "telemetria nao encerra o turno"
+    print("   decline em %.2fs" % dt)
+
+
+def case_elicit_unknown(port, tmp):
+    t0 = time.time()
+    code, r = http(port, "/send", {"text": "sql destrutivo"})
+    assert code == 200, (code, r)
+    p = wait_for(lambda: http(port, "/pending")[1]["pending"], 3, "pedido em /pending")
+    assert p[0]["request"]["mcp_server_name"] == "supabase", p
+    resp = wait_for(lambda: stub_log(tmp, "responses.jsonl"), 8, "cancel no prazo")
+    dt = resp[0]["ts"] - t0
+    assert resp[0]["response"] == {"action": "cancel"}, resp
+    assert 1.5 <= dt <= 6, "cancel fora da janela do prazo (2s): %.2fs" % dt
+    intr = wait_for(lambda: stub_log(tmp, "interrupts.jsonl"), 3, "interrupt do turno")
+    assert len(intr) == 1, intr
+    assert http(port, "/pending")[1]["pending"] == [], "pendente sobrou"
+    kinds = [a["kind"] for a in alerts(port)]
+    for k in ("control_request_pendente", "control_request_expirado", "interrupt"):
+        assert k in kinds, (k, kinds)
+    print("   cancel + interrupt em %.2fs" % dt)
+
+
+def case_elicit_muse_answers(port, tmp):
+    code, r = http(port, "/send", {"text": "sql destrutivo autorizado"})
+    assert code == 200, (code, r)
+    p = wait_for(lambda: http(port, "/pending")[1]["pending"], 3, "pedido em /pending")
+    code, r = http(port, "/respond", {"request_id": p[0]["request_id"],
+                                       "response": {"action": "accept", "content": {}}})
+    assert code == 200 and r["ok"], (code, r)
+    resp = wait_for(lambda: stub_log(tmp, "responses.jsonl"), 3, "resposta da Muse")
+    assert resp[0]["response"]["action"] == "accept", resp
+    time.sleep(2.5)  # passa do prazo de 2s: nada mais pode acontecer
+    assert len(stub_log(tmp, "responses.jsonl")) == 1, stub_log(tmp, "responses.jsonl")
+    assert not stub_log(tmp, "interrupts.jsonl"), "nao podia interromper"
+    assert http(port, "/pending")[1]["pending"] == []
+
+
 if __name__ == "__main__":
     ok = all([
         run_case("negacoes listadas (log + /status + /turns)", 8711,
@@ -276,5 +401,14 @@ if __name__ == "__main__":
                  case_model_error_fallback),
         run_case("model: troca durante turno -> 409", 8720,
                  {"STUB_EXP": iso(30), "STUB_HOLD": "1"}, case_model_busy),
+        run_case("elicitation: telemetria blender -> decline em <= 5s (C1)", 8721,
+                 {"STUB_EXP": iso(30), "STUB_ELICIT": "telemetry"},
+                 case_elicit_telemetry),
+        run_case("elicitation: desconhecida -> prazo, cancel e turno encerrado (D3/B)", 8722,
+                 {"STUB_EXP": iso(30), "STUB_ELICIT": "unknown",
+                  "BRIDGE_ELICIT_WAIT_S": "2"}, case_elicit_unknown),
+        run_case("elicitation: Muse responde no prazo -> nada e cancelado", 8723,
+                 {"STUB_EXP": iso(30), "STUB_ELICIT": "unknown",
+                  "BRIDGE_ELICIT_WAIT_S": "2"}, case_elicit_muse_answers),
     ])
     sys.exit(0 if ok else 1)

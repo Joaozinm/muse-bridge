@@ -39,6 +39,14 @@ para sempre (foi exatamente o que travou as escritas no Supabase em
 outubro/2026: a confirmação do MCP nunca era respondida numa sessão
 headless).
 
+**Prazo e política automática (F01 da auditoria de 11/11).** Para não
+travar de novo, a ponte responde sozinha o que a tabela `ELICITATION_POLICY`
+conhece (hoje: recusa o opt-in de telemetria do `blender-community`). Para
+qualquer outro pedido, a Muse tem 60 s (`BRIDGE_ELICIT_WAIT_S`); sem
+resposta, a ponte cancela o pedido e encerra o turno com `interrupt`
+(decisão D3, opção B). Tudo isso aparece como evento `bridge_alert`.
+Detalhes em `POLICY.md`.
+
 Política da Muse ao aprovar em nome do usuário (ver `POLICY.md`):
 aprova o que já foi autorizado na tarefa; escala para o usuário o que é
 destrutivo/irreversível e não foi autorizado; nega o que viola regras
