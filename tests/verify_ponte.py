@@ -33,8 +33,12 @@ def opt(name):
 model, resume = opt("--model"), opt("--resume")
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "args.jsonl"), "a") as f:
     f.write(json.dumps({"model": model, "resume": resume}) + "\n")
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pids.jsonl"), "a") as f:
+    f.write(json.dumps({"pid": os.getpid(), "resume": resume}) + "\n")
 if model and model == os.environ.get("STUB_DIE_MODEL"):
     sys.exit(1)
+if resume and resume == os.environ.get("STUB_DIE_RESUME"):
+    sys.exit(1)  # "No conversation found"
 sid = resume or "stub"
 HERE = os.path.dirname(os.path.abspath(__file__))
 def out(ev):
@@ -144,27 +148,42 @@ def http(port, path, body=None):
         return e.code, json.loads(e.read())
 
 
-def run_case(name, port, env_extra, check):
+def make_tmp():
     tmp = tempfile.mkdtemp(prefix="ponte-verify-")
     stub_py = os.path.join(tmp, "stub.py")
     with open(stub_py, "w", encoding="utf-8") as f:
         f.write(STUB)
-    stub_cmd = os.path.join(tmp, "claude.cmd")
-    with open(stub_cmd, "w", encoding="utf-8") as f:
+    with open(os.path.join(tmp, "claude.cmd"), "w", encoding="utf-8") as f:
         f.write('@"%s" "%s" %%*\n' % (sys.executable, stub_py))
-    env = dict(os.environ, CLAUDE_EXE=stub_cmd, BRIDGE_DIR=tmp,
+    return tmp
+
+
+def start_server(tmp, port, env_extra, repo=None, wait=True):
+    env = dict(os.environ, CLAUDE_EXE=os.path.join(tmp, "claude.cmd"), BRIDGE_DIR=tmp,
                BRIDGE_PORT=str(port), PYTHONUTF8="1", BRIDGE_MODEL_PROBE_S="1.5",
                BRIDGE_WATCH_TICK_S="0.2")
     env.update(env_extra)
-    srv = subprocess.Popen([sys.executable, SERVER, tmp, "127.0.0.1"], env=env,
+    srv = subprocess.Popen([sys.executable, SERVER, repo or tmp, "127.0.0.1"], env=env,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
+    if wait:
         for _ in range(50):
             try:
                 if http(port, "/status")[0] == 200:
                     break
             except OSError:
                 time.sleep(0.2)
+    return srv
+
+
+def stop_server(srv):
+    srv.terminate()
+    srv.wait(timeout=10)
+
+
+def run_case(name, port, env_extra, check):
+    tmp = make_tmp()
+    srv = start_server(tmp, port, env_extra)
+    try:
         check(port) if check.__code__.co_argcount == 1 else check(port, tmp)
         print("PASS", name)
         return True
@@ -507,6 +526,112 @@ def case_reentrada(port, tmp):
     assert len(http(port, "/turns")[1]["turns"]) == 1, "um brief, uma entrada"
 
 
+# ---------------- estado persistente e partida segura (F10, F21) ----------------
+def run_custom(name, fn):
+    try:
+        fn()
+        print("PASS", name)
+        return True
+    except AssertionError as e:
+        print("FAIL", name, "-", e)
+        return False
+
+
+def case_c6_claude_morre(port, tmp):
+    code, r = http(port, "/send", {"text": "turno que vai perder o claude"})
+    assert code == 200, (code, r)
+    pid = stub_log(tmp, "pids.jsonl")[-1]["pid"]
+    os.kill(pid, 9)
+    st = wait_closed(port, 6)
+    assert st["last_turn"]["outcome"] == "morto", st["last_turn"]
+    assert st["last_turn"]["cost_turn_usd"] is None, st["last_turn"]
+    sp = wait_for(lambda: [s for s in spawns(tmp) if s["resume"] == "stub"], 6,
+                  "retomada com --resume")
+    assert sp[-1] == {"model": None, "resume": "stub"}, spawns(tmp)
+    st = wait_for(lambda: (lambda s: s if s["alive"] else None)(http(port, "/status")[1]),
+                  5, "sessao viva de novo")
+    assert st["session_id"] == "stub", st
+    assert "claude_morto" in [a["kind"] for a in alerts(port)]
+    code, r = http(port, "/send", {"text": "segue"})
+    assert code == 200, (code, r)
+
+
+def case_c7_reinicio_ocioso():
+    port = 8731
+    tmp = make_tmp()
+    other = os.path.join(tmp, "outro-repo")
+    os.makedirs(other)
+    env = {"STUB_EXP": iso(30)}
+    srv = start_server(tmp, port, env)
+    try:
+        code, r = http(port, "/switch-repo", {"path": other})
+        assert code == 200, (code, r)
+        send_turn(port, {"text": "planeja", "model": "fable"})
+        st = http(port, "/status")[1]
+        assert st["repo"] == other and st["model"] == "claude-fable-5-2", st
+    finally:
+        stop_server(srv)
+    with open(os.path.join(tmp, "state.json")) as f:
+        state = json.load(f)
+    assert state["repo"] == other and state["model"] == "claude-fable-5-2", state
+    assert state["session_id"] == "stub", state
+    n = len(spawns(tmp))
+    srv = start_server(tmp, port, env)  # mesmo argumento de antes: tmp
+    try:
+        st = wait_for(lambda: (lambda s: s if s["alive"] else None)(http(port, "/status")[1]),
+                      5, "ponte de volta")
+        assert st["repo"] == other, "voltou no repo do argumento: %s" % st["repo"]
+        assert st["model"] == "claude-fable-5-2", st
+        assert spawns(tmp)[n:] == [{"model": "claude-fable-5-2", "resume": "stub"}], spawns(tmp)
+        send_turn(port, {"text": "segue no mesmo repo"})
+    finally:
+        stop_server(srv)
+
+
+def case_resume_invalido():
+    port = 8732
+    tmp = make_tmp()
+    with open(os.path.join(tmp, "state.json"), "w") as f:
+        json.dump({"repo": tmp, "model": None, "session_id": "sumiu"}, f)
+    srv = start_server(tmp, port, {"STUB_EXP": iso(30), "STUB_DIE_RESUME": "sumiu"})
+    try:
+        st = wait_for(lambda: (lambda s: s if s["alive"] else None)(http(port, "/status")[1]),
+                      6, "ponte viva sem o resume")
+        assert spawns(tmp) == [{"model": None, "resume": "sumiu"},
+                               {"model": None, "resume": None}], spawns(tmp)
+        assert "resume_falhou" in [a["kind"] for a in alerts(port)]
+        send_turn(port, {"text": "oi"})
+    finally:
+        stop_server(srv)
+
+
+def case_porta_ocupada():
+    import socket
+    port = 8733
+    tmp = make_tmp()
+    hold = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    hold.bind(("127.0.0.1", port))
+    hold.listen(1)
+    try:
+        t0 = time.time()
+        srv = start_server(tmp, port, {"STUB_EXP": iso(30), "BRIDGE_BIND_RETRY_S": "1"},
+                           wait=False)
+        try:
+            rc = srv.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            stop_server(srv)
+            raise AssertionError("a ponte nao saiu com a porta ocupada")
+        assert rc == 2, "codigo de saida %s" % rc
+        assert not os.path.exists(os.path.join(tmp, "args.jsonl")), "abriu claude orfao"
+        assert not os.path.exists(os.path.join(tmp, "pids.jsonl")), "abriu claude orfao"
+        with open(os.path.join(tmp, "sessao.log"), encoding="utf-8") as f:
+            lg = f.read()
+        assert "SEM abrir o claude" in lg, lg
+        print("   saiu em %.1fs, sem claude" % (time.time() - t0))
+    finally:
+        hold.close()
+
+
 if __name__ == "__main__":
     ok = all([
         run_case("negacoes listadas (log + /status + /turns)", 8711,
@@ -556,5 +681,13 @@ if __name__ == "__main__":
                       BRIDGE_TURN_MAX_S="1.5"), case_teto),
         run_case("vigia F23: result com background aberto -> mesmo brief, custo em delta", 8729,
                  dict(FAST_WATCH, STUB_EXP=iso(30), STUB_REENTRY="1"), case_reentrada),
+        run_case("partida C6: claude morre em voo -> turno morto, retomada com --resume", 8730,
+                 dict(FAST_WATCH, STUB_EXP=iso(30), STUB_HOLD="1"), case_c6_claude_morre),
+        run_custom("partida C7: reinicio ocioso volta no mesmo repo, modelo e sessao",
+                   case_c7_reinicio_ocioso),
+        run_custom("partida: --resume invalido -> sessao nova no mesmo repo",
+                   case_resume_invalido),
+        run_custom("partida: porta ocupada -> sai sem abrir claude (F21)",
+                   case_porta_ocupada),
     ])
     sys.exit(0 if ok else 1)

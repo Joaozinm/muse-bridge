@@ -60,6 +60,7 @@ tailnet de um unico usuario).
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -79,6 +80,7 @@ LOG_PATH = os.path.join(BRIDGE_DIR, "sessao.log")
 ERR_PATH = os.path.join(BRIDGE_DIR, "claude-stderr.log")
 JSONL_PATH = os.path.join(BRIDGE_DIR, "events.jsonl")
 SHOT_PATH = os.path.join(BRIDGE_DIR, "screenshot.png")
+STATE_PATH = os.path.join(BRIDGE_DIR, "state.json")
 
 os.makedirs(BRIDGE_DIR, exist_ok=True)
 
@@ -806,7 +808,7 @@ cli_model = None       # o modelo que o CLI informou no evento init
 model_fallback = None  # {"requested","used","reason","ts"} da ultima queda
 model_failures = {}    # modelo -> falhas de troca
 turn_in_flight = False
-switch_lock = threading.Lock()
+switch_lock = threading.RLock()  # serializa todo (re)spawn do claude
 
 
 def resolve_model(value):
@@ -943,6 +945,7 @@ def spawn_claude(model=None, resume=None):
     session_id = resume  # com --resume a sessao continua a mesma
     threading.Thread(target=reader_loop, daemon=True).start()
     log("claude iniciado (pid=%s)" % claude_proc.pid)
+    save_state()
 
 
 def claude_alive():
@@ -971,10 +974,14 @@ def reader_loop():
                 except Exception as e:  # vigia nunca derruba o reader
                     log("falha no batimento (seq=%s): %s" % (seq, e))
             if etype == "system" and ev.get("subtype") == "init":
-                session_id = ev.get("session_id")
-                cli_model = ev.get("model") or cli_model
-                log("sessao pronta: session_id=%s model=%s (seq=%s)"
-                    % (session_id, cli_model, seq))
+                if proc is claude_proc:
+                    changed = session_id != ev.get("session_id")
+                    session_id = ev.get("session_id")
+                    cli_model = ev.get("model") or cli_model
+                    if changed:
+                        log("sessao pronta: session_id=%s model=%s (seq=%s)"
+                            % (session_id, cli_model, seq))
+                        save_state()
             elif etype == "control_request":
                 try:
                     handle_control_request(ev, seq)
@@ -1056,6 +1063,11 @@ def interrupt_turn(reason):
 
 def restart_claude(model=None, resume=None):
     """Mata o claude e sobe outro. Sem `model`, mantem o modelo corrente."""
+    with switch_lock:  # o vigia nao pode ressuscitar no meio
+        _restart_claude(model, resume)
+
+
+def _restart_claude(model, resume):
     if model is None:
         model = current_model
     log("reiniciando sessao do claude...")
@@ -1076,14 +1088,117 @@ def restart_claude(model=None, resume=None):
     spawn_claude(model=model, resume=resume)
 
 
+# ---------------- estado persistente (F10) ----------------
+# repo, modelo e sessao sobrevivem ao reinicio da ponte: antes, a tarefa
+# voltava no repo do argumento (10:18:39 de 11/11, nootrieapp) e numa sessao nova.
+_saved_state = {"v": None}
+
+
+def load_state(path=None):
+    """-> dict (vazio se nao ha arquivo ou se ele e invalido)."""
+    try:
+        with open(path or STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_state():
+    """Grava repo/modelo/sessao de forma atomica, so quando mudou."""
+    data = {"repo": REPO_DIR, "model": current_model, "session_id": session_id}
+    if data == _saved_state["v"]:
+        return
+    out = dict(data, updated_at=time.time())
+    tmp = STATE_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, STATE_PATH)
+        _saved_state["v"] = data
+    except OSError as e:
+        log("state.json falhou: %s" % e)
+
+
+def restore_plan(state, argv_repo):
+    """-> (repo, model, resume, motivo). Pura. A sessao so e retomada no
+    mesmo repo em que ela nasceu (o CLI guarda sessoes por pasta)."""
+    repo = state.get("repo")
+    if not (isinstance(repo, str) and repo and os.path.isdir(repo)):
+        return argv_repo, None, None, ("sem state.json" if not state
+                                       else "repo do state.json invalido")
+    model = state.get("model")
+    model = model if model in (MODEL_FABLE, MODEL_OPUS) else None
+    sid = state.get("session_id")
+    sid = sid if isinstance(sid, str) and sid else None
+    return repo, model, sid, "restaurado do state.json"
+
+
+def start_claude(model=None, resume=None):
+    """Sobe o claude; se o --resume nao pegar (processo morre logo), sobe sem."""
+    with switch_lock:
+        spawn_claude(model=model, resume=resume)
+        if not resume:
+            return
+        deadline = time.time() + MODEL_PROBE_S
+        while time.time() < deadline and claude_alive():
+            time.sleep(0.1)
+        if claude_alive():
+            return
+        bridge_alert("resume_falhou", "warn",
+                     "--resume %s nao subiu; sessao nova no mesmo repo" % resume,
+                     session_id=resume)
+        spawn_claude(model=model, resume=None)
+
+
 # ---------------- vigia (um thread, um tique por WATCH_TICK_S) ----------------
 WATCH_TICK_S = float(os.environ.get("BRIDGE_WATCH_TICK_S", "1"))
+AUTO_RESPAWN = os.environ.get("BRIDGE_AUTO_RESPAWN", "1") == "1"
+RESPAWN_MAX, RESPAWN_WINDOW_S = 3, 600.0
+_respawns = []
+_respawn_capped = [False]
+
+
+def maybe_respawn(now=None):
+    """O claude morreu sozinho (C6): retoma a sessao com --resume. No maximo
+    RESPAWN_MAX vezes em RESPAWN_WINDOW_S, para nao virar laco."""
+    if not AUTO_RESPAWN:
+        return
+    now = time.time() if now is None else now
+    with claude_lock:
+        p = claude_proc
+    if p is None or p.poll() is None:
+        return
+    if not switch_lock.acquire(blocking=False):
+        return  # troca de modelo / restart em andamento cuida disso
+    try:
+        with claude_lock:
+            if claude_proc is not p:
+                return
+        _respawns[:] = [t for t in _respawns if now - t < RESPAWN_WINDOW_S]
+        if len(_respawns) >= RESPAWN_MAX:
+            if not _respawn_capped[0]:
+                _respawn_capped[0] = True
+                bridge_alert("claude_morto", "action",
+                             "claude morreu %d vezes em %.0f min; nao retomo mais "
+                             "sozinho (POST /restart)" % (RESPAWN_MAX, RESPAWN_WINDOW_S / 60))
+            return
+        _respawn_capped[0] = False
+        _respawns.append(now)
+        bridge_alert("claude_morto", "action",
+                     "processo do claude morreu (exit=%s); retomando com --resume %s"
+                     % (p.poll(), session_id or "-"),
+                     exit_code=p.poll(), session_id=session_id)
+        start_claude(model=current_model, resume=session_id)
+    finally:
+        switch_lock.release()
 
 
 def watchdog_tick(now=None):
     now = time.time() if now is None else now
     expire_pending(now)
     watch_turn(now)
+    maybe_respawn(now)
 
 
 def watchdog_loop():
@@ -1311,6 +1426,41 @@ def resolve_repo_file(repo_dir, rel):
     return 200, full, ctype
 
 
+class BridgeHTTPServer(ThreadingHTTPServer):
+    """No Windows, SO_REUSEADDR deixa um segundo processo escutar na MESMA
+    porta; aqui a porta ocupada tem que falhar o bind (F21)."""
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+BIND_RETRY_S = float(os.environ.get("BRIDGE_BIND_RETRY_S", "90"))
+
+
+def bind_http():
+    """Faz o bind ANTES de abrir o claude. No boot o IP do Tailscale pode ainda
+    nao existir: tenta por BIND_RETRY_S. -> servidor ou None."""
+    deadline = time.time() + BIND_RETRY_S
+    tries = 0
+    while True:
+        tries += 1
+        try:
+            return BridgeHTTPServer((BIND_IP, PORT), Handler)
+        except OSError as e:
+            if time.time() >= deadline:
+                log("!!! bind em %s:%d falhou %d vez(es) (%s); saindo SEM abrir o claude"
+                    % (BIND_IP, PORT, tries, e))
+                return None
+            if tries == 1 or tries % 10 == 0:
+                log("bind em %s:%d falhou (%s); tentando de novo por ate %.0fs"
+                    % (BIND_IP, PORT, e, BIND_RETRY_S))
+            time.sleep(min(2.0, max(0.2, BIND_RETRY_S / 5)))
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -1536,7 +1686,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "error": "diretorio invalido"}, 400)
             REPO_DIR = os.path.abspath(path)
             log("repo trocado para %s" % REPO_DIR)
-            restart_claude()
+            restart_claude()  # sessao nova no repo novo; o spawn grava o state.json
             return self._json({"ok": True, "repo": REPO_DIR,
                                "session": "alive" if claude_alive() else "dead"})
 
@@ -1544,18 +1694,26 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    log("== ponte v2 - sessao persistente via stream-json ==")
-    log("repo=%s bind=%s:%d" % (REPO_DIR, BIND_IP, PORT))
+    global REPO_DIR
+    log("== ponte v2 - sessao persistente via stream-json (pid=%d) ==" % os.getpid())
+    repo, model, resume, why = restore_plan(load_state(), REPO_DIR)
+    if repo != REPO_DIR:
+        log("repo do argumento (%s) substituido pelo state.json: %s" % (REPO_DIR, repo))
+    REPO_DIR = repo
+    log("repo=%s bind=%s:%d model=%s resume=%s (%s)"
+        % (REPO_DIR, BIND_IP, PORT, model or "default", resume or "-", why))
     if not os.path.isfile(CLAUDE_EXE):
         log("AVISO: claude nao encontrado em %s (env CLAUDE_EXE p/ override)"
             % CLAUDE_EXE)
+    srv = bind_http()  # F21: sem porta, nao abre claude nenhum
+    if srv is None:
+        sys.exit(2)
     n = replay_jsonl()
     if n:
         log("historico restaurado do disco: %d eventos" % n)
     check_login(force=True)
-    spawn_claude()
+    start_claude(model=model, resume=resume)
     threading.Thread(target=watchdog_loop, daemon=True).start()
-    srv = ThreadingHTTPServer((BIND_IP, PORT), Handler)
     log("HTTP no ar em http://%s:%d" % (BIND_IP, PORT))
     log("Transcricao ao vivo em http://%s:%d/transcript" % (BIND_IP, PORT))
     try:

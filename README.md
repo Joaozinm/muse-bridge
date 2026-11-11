@@ -111,6 +111,25 @@ background terminou). Prazos (decisão D4 do João):
   `BRIDGE_SILENCE_KILL_S`, `BRIDGE_TURN_MAX_S`, `BRIDGE_MCP_WARN_S`,
   `BRIDGE_MCP_KILL_S`), mas o valor de produção é o da tabela.
 
+## Estado persistente e partida (F10, F21)
+
+- `~/.muse-bridge/state.json` guarda `repo`, `model` e `session_id`, gravado
+  (de forma atômica) a cada mudança. Na partida, se o repo do arquivo existe,
+  ele **vence o argumento da tarefa** e a sessão é retomada com
+  `--resume <session_id> --model <model>`. Se o `--resume` não sobe, a
+  ponte abre sessão nova no mesmo repo (`bridge_alert` `resume_falhou`).
+- O bind HTTP acontece **antes** de abrir o `claude`. Se a porta ou o IP não
+  estão disponíveis (ex.: Tailscale ainda subindo no boot), a ponte tenta por
+  90 s (`BRIDGE_BIND_RETRY_S`) e sai com código 2 **sem abrir claude nenhum**.
+  No Windows o bind é exclusivo (`SO_EXCLUSIVEADDRUSE`): uma segunda ponte não
+  consegue escutar na mesma porta.
+- Se o `claude` morre sozinho, o vigia fecha o turno em voo como `morto` e
+  retoma a sessão com `--resume` (no máximo 3 vezes em 10 min; depois só com
+  `POST /restart`).
+- A tarefa agendada (Install.ps1) roda o python via `cmd.exe` e manda o
+  stderr para `~/.muse-bridge/task-stderr.log`. Vale a partir da próxima
+  execução do `Install.ps1`.
+
 ## Auto-diagnóstico
 
 Quando a Muse detecta um travamento (sem eventos novos por minutos, ou

@@ -93,8 +93,18 @@ try {
 # 4. Cria (ou recria) a tarefa agendada
 Write-Host "-- criando tarefa agendada '$TaskName' ..."
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-$action = New-ScheduledTaskAction -Execute $pythonPath `
-  -Argument "`"$ServerPy`" `"$RepoDir`" $ip" -WorkingDirectory $InstallDir
+# F21 (auditoria 11/11): a saida de erro da tarefa ia para lugar nenhum, entao
+# um laco de partida nao deixava rastro. O cmd.exe redireciona o stderr do
+# python (tracebacks, falha antes do log) para ~/.muse-bridge/task-stderr.log.
+# O stdout nao vai para arquivo: e o mesmo conteudo do sessao.log.
+# O repo do argumento so vale na primeira partida; depois manda o state.json.
+$bridgeDir = Join-Path $env:USERPROFILE ".muse-bridge"
+New-Item -ItemType Directory -Force -Path $bridgeDir | Out-Null
+$taskLog = Join-Path $bridgeDir "task-stderr.log"
+$inner = "`"$pythonPath`" `"$ServerPy`" `"$RepoDir`" $ip 1>nul 2>>`"$taskLog`""
+$action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" `
+  -Argument "/d /c `"$inner`"" -WorkingDirectory $InstallDir
+Write-Host "Saida de erro da tarefa: $taskLog"
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet -RestartCount 3 `
   -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
