@@ -39,6 +39,14 @@ para sempre (foi exatamente o que travou as escritas no Supabase em
 outubro/2026: a confirmação do MCP nunca era respondida numa sessão
 headless).
 
+**Prazo e política automática (F01 da auditoria de 11/11).** Para não
+travar de novo, a ponte responde sozinha o que a tabela `ELICITATION_POLICY`
+conhece (hoje: recusa o opt-in de telemetria do `blender-community`). Para
+qualquer outro pedido, a Muse tem 60 s (`BRIDGE_ELICIT_WAIT_S`); sem
+resposta, a ponte cancela o pedido e encerra o turno com `interrupt`
+(decisão D3, opção B). Tudo isso aparece como evento `bridge_alert`.
+Detalhes em `POLICY.md`.
+
 Política da Muse ao aprovar em nome do usuário (ver `POLICY.md`):
 aprova o que já foi autorizado na tarefa; escala para o usuário o que é
 destrutivo/irreversível e não foi autorizado; nega o que viola regras
@@ -73,6 +81,71 @@ Quem despacha escolhe o modelo de cada turno com o campo `model` do
   do processo; `null` = default do CLI), `model_cli` (o que o CLI informou no
   `init`) e `model_fallback`.
 
+## Vigia de turno (F02, F06, F13, F23 da auditoria)
+
+Um **turno** é um brief: tudo o que um `/send` dispara, inclusive os
+`result` extras de quando o CLI volta a trabalhar sozinho (uma tarefa em
+background terminou). Prazos (decisão D4 do João):
+
+| Situação | Aviso | Ação |
+|---|---|---|
+| Nenhum evento com turno em voo | 120 s (`bridge_alert` `silencio`, com nº de pendências e screenshot) | 300 s: `interrupt`, turno `stalled` |
+| Chamada MCP (`mcp__*`) em voo | 30 s (`mcp_lenta`) | 120 s: `interrupt`, turno `mcp_longa` |
+| Duração do turno | — | 45 min: `interrupt`, turno `teto` |
+| Interrupt sem `result` em 15 s | — | turno fechado com `cost_turn_usd: null`, `cost_reason: "sem result"` |
+| Processo do `claude` morreu | — | turno `morto` |
+
+- `/send` com turno em voo devolve **409**. Para enfileirar de propósito:
+  `"queue": true` (a mensagem entra no mesmo brief).
+- `POST /interrupt` `{"reason": "..."}` interrompe o turno em voo (409 se não
+  houver, a menos que `"force": true`). A ponte nunca reenvia o brief.
+- `result` com tarefa em background aberta não fecha o turno: ele fica
+  `esperando_background` até a tarefa terminar e vir o próximo `result`.
+- Custo: o `total_cost_usd` do CLI é acumulado **por processo** (zera
+  quando o processo sobe de novo, mesmo com `--resume`). A ponte publica
+  `cost_turn_usd` (delta, somado por brief) e `cost_session_usd` (o valor
+  cru) em `/turns` e `/status.last_turn`.
+- `/status` traz `turn_in_flight`, `turn` (brief, idade, estado, results),
+  `last_event_age_s`, `tool_in_flight`, `background_tasks` e `limits`.
+- Os prazos podem ser mudados por env (`BRIDGE_SILENCE_WARN_S`,
+  `BRIDGE_SILENCE_KILL_S`, `BRIDGE_TURN_MAX_S`, `BRIDGE_MCP_WARN_S`,
+  `BRIDGE_MCP_KILL_S`), mas o valor de produção é o da tabela.
+
+## Estado persistente e partida (F10, F21)
+
+- `~/.muse-bridge/state.json` guarda `repo`, `model` e `session_id`, gravado
+  (de forma atômica) a cada mudança. Na partida, se o repo do arquivo existe,
+  ele **vence o argumento da tarefa** e a sessão é retomada com
+  `--resume <session_id> --model <model>`. Se o `--resume` não sobe, a
+  ponte abre sessão nova no mesmo repo (`bridge_alert` `resume_falhou`).
+- O bind HTTP acontece **antes** de abrir o `claude`. Se a porta ou o IP não
+  estão disponíveis (ex.: Tailscale ainda subindo no boot), a ponte tenta por
+  90 s (`BRIDGE_BIND_RETRY_S`) e sai com código 2 **sem abrir claude nenhum**.
+  No Windows o bind é exclusivo (`SO_EXCLUSIVEADDRUSE`): uma segunda ponte não
+  consegue escutar na mesma porta.
+- Se o `claude` morre sozinho, o vigia fecha o turno em voo como `morto` e
+  retoma a sessão com `--resume` (no máximo 3 vezes em 10 min; depois só com
+  `POST /restart`).
+- A tarefa agendada (Install.ps1) roda o python via `cmd.exe` e manda o
+  stderr para `~/.muse-bridge/task-stderr.log`. Vale a partir da próxima
+  execução do `Install.ps1`.
+
+## Log de eventos (F11, F12)
+
+- Na partida, a ponte lê só o **fim** dos arquivos (últimos 5.000 eventos):
+  0,02 s no `events.jsonl` real de 930 MB, contra 36 s antes.
+- Os `stream_event` (parciais de `--include-partial-messages`) continuam na
+  memória e no `/events`, mas no disco vão para `events-partial.jsonl`.
+- Passando de 200 MB (`BRIDGE_ROTATE_MB`), o arquivo é **renomeado** para
+  `events-AAAAMMDD-HHMMSS.jsonl` (ou `events-partial-…`). Nada é apagado.
+- `~/.muse-bridge/rotation-hold.json` presente = rotação suspensa. Ele foi
+  criado em 11/11 porque o destino do `events.jsonl` antigo de 930 MB ainda é
+  decisão do João (D5). Para liberar a rotação, apague esse arquivo.
+- `/events?since=N` com `N` anterior à janela da memória devolve, além de
+  `events`, `"gap": true`, `first_seq` e `last_seq`. Sem lacuna, a resposta
+  é a mesma de antes (`{"events": [...]}`).
+- `/status.log_files` traz o tamanho dos arquivos, o limite e se há trava.
+
 ## Auto-diagnóstico
 
 Quando a Muse detecta um travamento (sem eventos novos por minutos, ou
@@ -89,8 +162,9 @@ Screenshots são usados só para depurar o trabalho do agente.
 | Rota | Uso |
 |---|---|
 | `GET /health` | servidor vivo? sessão viva? |
-| `GET /status` | sessão, eventos, pendências, uptime, repo atual, `model`, `model_fallback` |
-| `POST /send` | `{"text": "...", "model": "fable"}` → manda tarefa (`model` opcional, ver abaixo) |
+| `GET /status` | sessão, eventos, pendências, uptime, repo atual, `model`, `model_fallback`, `turn_in_flight`, `turn`, `last_event_age_s`, `tool_in_flight` |
+| `POST /send` | `{"text": "...", "model": "fable", "queue": false}` → manda tarefa (`model` e `queue` opcionais); 409 com turno em voo |
+| `POST /interrupt` | `{"reason": "..."}` → interrompe o turno em voo |
 | `GET /events` | `?since=N&timeout=S` → long-poll de eventos |
 | `GET /transcript` | página ao vivo |
 | `GET /pending` | control_requests sem resposta |
