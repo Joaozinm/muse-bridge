@@ -18,9 +18,16 @@ Endpoints:
                                         "turn_in_flight":..,"turn":{...},
                                         "last_event_age_s":..,"tool_in_flight":[...],
                                         "background_tasks":N,"limits":{...}}
-  POST /send        {"text": "...", "model": "fable"|"opus"|<id>, "queue": bool}
-                                     -> {"ok":true,"after_seq":N,"brief_id":N,"queued":..,"model":...}
+  POST /send        {"text": "...", "model": "fable"|"opus"|<id>, "queue": bool,
+                     "budget_min": N, "budget_usd": N,          (orcamento do brief; gate B3/U5)
+                     "projeto": "...", "fase": "...",           (nome do registro de run)
+                     "checkpoint": "<rel>", "artefatos": ["<rel>", ...]}  (gates V1/V6/V7)
+                                     -> {"ok":true,"after_seq":N,"brief_id":N,"queued":..,"model":...,"budget":{...}}
                                      409 se ha turno em voo (salvo "queue": true)
+                                     Ao fim do turno, se o repo atual tem driver/gates.py, a ponte roda
+                                     `python driver/gates.py verify ... --record` (mesmos gates do driver)
+  GET  /pipeline                     -> status.json + 10 ultimos runs do repo (driver/gates.py pipeline)
+                                        + o ultimo verify da ponte; "available": false sem gates.py
   POST /interrupt   {"reason": "...", "force": bool} -> interrompe o turno em voo
                                      (409 sem turno em voo, salvo "force": true)
   GET  /events?since=N&timeout=S     -> {"events":[...]} (long-poll); com since
@@ -192,6 +199,7 @@ def push_event(ev):
             log("JSONL falhou: %s" % e)
     if rotated:
         log("log de eventos rotacionado: %s -> %s" % (path, rotated))
+    capture_turn_event(ev)
     return ev["seq"]
 
 
@@ -495,6 +503,10 @@ def _new_brief(brief_seq, model, queued_from=None):
             "cost_session_usd": None, "cost_reason": None,
             "interrupt_ts": None, "interrupt_outcome": None,
             "warned": {}, "in_list": False,
+            # Fase B, passo 9: orcamento, registro e gates da esteira
+            "budget_min": None, "budget_usd": None, "projeto": None, "fase": None,
+            "checkpoint": None, "artefatos": None, "repo": REPO_DIR,
+            "stream_path": None, "brief_path": None, "verify": None,
             # campos do formato antigo de /turns (ultimo result)
             "seq": None, "ts": now, "session_id": session_id,
             "subtype": None, "is_error": None, "denials_reported": None,
@@ -510,7 +522,7 @@ def _publish_locked(b):
         b["in_list"] = True
 
 
-def open_turn(brief_seq, model, queued=False):
+def open_turn(brief_seq, model, queued=False, meta=None, text=None):
     """Chamado pelo /send. Com queue=True e turno em voo, a mensagem entra no
     brief atual (mais um result esperado). -> o brief."""
     global cur_turn, last_brief, turn_in_flight, last_event_ts
@@ -519,6 +531,9 @@ def open_turn(brief_seq, model, queued=False):
             cur_turn["expected_results"] += 1
             return cur_turn
         b = _new_brief(brief_seq, model)
+        b.update(meta or {})
+        b["repo"] = REPO_DIR
+        start_capture(b, text)
         cur_turn = last_brief = b
         turn_in_flight = True
         last_event_ts = time.time()
@@ -550,6 +565,7 @@ def close_turn(outcome, reason, alert_level="action"):
         snap = turn_public(b)
     log("turno fechado: brief=%s desfecho=%s motivo=%s custo=%s"
         % (snap["brief_id"], outcome, reason, snap["cost_turn_usd"]))
+    schedule_verify(snap)
     if alert_level:
         bridge_alert("turno_fechado", alert_level,
                      "turno %s fechado como %s: %s" % (snap["brief_id"], outcome, reason),
@@ -738,7 +754,10 @@ def watch_turn(now=None):
         else:
             age = now - b["started_ts"]
             silent = now - (last_event_ts or b["started_ts"])
-            if age >= TURN_MAX_S:
+            bmin = b.get("budget_min")
+            if bmin and age >= bmin * 60 and age < TURN_MAX_S:
+                kill = ("orcamento", "passou do teto de %.0f min do brief (budget_min)" % bmin)
+            elif age >= TURN_MAX_S:
                 kill = ("teto", "teto duro de %.0f min por turno" % (TURN_MAX_S / 60))
             elif b["state"] == "running" and silent >= SILENCE_KILL_S:
                 kill = ("stalled", "%.0fs sem nenhum evento" % silent)
@@ -773,6 +792,219 @@ def watch_turn(now=None):
     elif kill:
         mark_interrupt(kill[0], kill[1])
         interrupt_turn(kill[1])
+
+
+# ---------------- gates da esteira no caminho da ponte (F04, F05) ----------------
+# Fase B, passo 9 da auditoria 2026-11-11: os mesmos gates do driver valem aqui. A
+# ponte grava o stream de cada brief em BRIDGE_DIR/turnos/ (o events.jsonl nao muda)
+# e, no fim do turno, roda `python driver/gates.py verify` do repo atual, se existir.
+TURNS_DIR = os.path.join(BRIDGE_DIR, "turnos")
+GATES_REL = os.path.join("driver", "gates.py")
+VERIFY_TIMEOUT_S = float(os.environ.get("BRIDGE_VERIFY_TIMEOUT_S", "180"))
+PIPELINE_TIMEOUT_S = float(os.environ.get("BRIDGE_PIPELINE_TIMEOUT_S", "20"))
+SUB_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+capture_lock = threading.Lock()
+verify_state = {"last": None, "running": 0}
+_SAFE_NAME = __import__("re").compile(r"^[A-Za-z0-9_.-]{1,60}$")
+
+
+def parse_send_meta(data):
+    """Campos opcionais do /send. -> (meta, erro)."""
+    meta = {}
+    for k in ("budget_min", "budget_usd"):
+        v = data.get(k)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+            return None, "%s precisa ser numero > 0" % k
+        meta[k] = float(v)
+    for k in ("projeto", "fase"):
+        v = data.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, str) or not _SAFE_NAME.match(v):
+            return None, "%s invalido (letras, numeros, _ . -; ate 60)" % k
+        meta[k] = v
+    ck = data.get("checkpoint")
+    if ck is not None:
+        if not isinstance(ck, str) or not ck:
+            return None, "checkpoint precisa ser caminho relativo ao repo"
+        meta["checkpoint"] = ck
+    arts = data.get("artefatos")
+    if arts is not None:
+        if not isinstance(arts, list) or not all(isinstance(a, str) and a for a in arts):
+            return None, "artefatos precisa ser lista de caminhos relativos ao repo"
+        meta["artefatos"] = arts
+    return meta, None
+
+
+def start_capture(b, text):
+    """Abre os arquivos do brief: texto do /send e stream (jsonl) dos eventos."""
+    try:
+        os.makedirs(TURNS_DIR, exist_ok=True)
+        base = os.path.join(TURNS_DIR, "%s-brief%d" % (
+            datetime.fromtimestamp(b["started_ts"]).strftime("%Y%m%d-%H%M%S"), b["brief_id"]))
+        b["brief_path"] = base + ".md"
+        b["stream_path"] = base + ".jsonl"
+        with open(b["brief_path"], "w", encoding="utf-8") as f:
+            f.write(text or "")
+        open(b["stream_path"], "w", encoding="utf-8").close()
+    except OSError as e:
+        log("captura do brief falhou: %s" % e)
+        b["stream_path"] = b["brief_path"] = None
+
+
+def capture_turn_event(ev):
+    """Copia o evento para o stream do brief em voo (sem os parciais). Nunca levanta."""
+    if ev.get("type") == "stream_event":
+        return
+    b = cur_turn
+    path = b.get("stream_path") if b is not None else None
+    if not path:
+        return
+    try:
+        line = json.dumps(ev, ensure_ascii=False) + "\n"
+        with capture_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except (OSError, TypeError, ValueError) as e:
+        log("captura do evento falhou: %s" % e)
+
+
+def gates_script(repo):
+    path = os.path.join(repo or "", GATES_REL)
+    return path if repo and os.path.isfile(path) else None
+
+
+def _inside(repo, rel):
+    target = os.path.abspath(os.path.join(repo, rel))
+    try:
+        return target if os.path.commonpath([os.path.abspath(repo), target]) == os.path.abspath(repo) else None
+    except ValueError:
+        return None
+
+
+def build_verify_cmd(snap, script, pending_now=0):
+    repo = snap["repo"]
+    cmd = [sys.executable, script, "verify", "--stream", snap["stream_path"],
+           "--pending", str(pending_now), "--turn-start", repr(snap["started_ts"]),
+           "--record", "--caminho", "ponte",
+           "--projeto", snap.get("projeto") or "ponte",
+           "--fase", snap.get("fase") or "brief%d" % snap["brief_id"]]
+    if snap.get("brief_path"):
+        cmd += ["--brief", snap["brief_path"]]
+    if snap.get("model"):
+        cmd += ["--modelo", snap["model"]]
+    for k, flag in (("budget_min", "--budget-min"), ("budget_usd", "--budget-usd"),
+                    ("cost_turn_usd", "--cost-turn")):
+        if snap.get(k) is not None:
+            cmd += [flag, repr(snap[k])]
+    if snap.get("checkpoint"):
+        ck = _inside(repo, snap["checkpoint"])
+        if ck:
+            cmd += ["--checkpoint", ck]
+    arts = [a for a in (_inside(repo, r) for r in snap.get("artefatos") or []) if a]
+    if arts:
+        cmd += ["--artifacts", ",".join(arts)]
+    return cmd
+
+
+def _store_verify(brief_id, result):
+    with turn_lock:
+        with turns_lock:
+            known = list(turns)
+        for b in [cur_turn, last_brief] + known:
+            if b is not None and b.get("brief_id") == brief_id:
+                b["verify"] = result
+                break
+    verify_state["last"] = result
+
+
+def run_verify(snap):
+    """Roda `driver/gates.py verify` do repo do brief. -> resultado publico (dict). Nunca levanta."""
+    script = gates_script(snap.get("repo"))
+    base = {"brief_id": snap["brief_id"], "repo": snap.get("repo"), "ts": time.time()}
+    if not script:
+        return dict(base, available=False, motivo="repo sem %s" % GATES_REL)
+    if not snap.get("stream_path") or not os.path.exists(snap["stream_path"]):
+        return dict(base, available=True, overall=None, error="stream do brief ausente")
+    cmd = build_verify_cmd(snap, script, len(pending_snapshot()))
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd, cwd=snap["repo"], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=VERIFY_TIMEOUT_S, creationflags=SUB_NO_WINDOW,
+                           env=dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8"))
+        lines = [ln for ln in p.stdout.splitlines() if ln.strip().startswith("{")]
+        data = json.loads(lines[-1]) if lines else {"error": "verify sem JSON (rc=%s): %s"
+                                                       % (p.returncode, p.stderr[-400:])}
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        data = {"error": "verify falhou: %s" % e}
+    out = dict(base, available=True, seconds=round(time.time() - t0, 1),
+               overall=data.get("overall"), gates=data.get("gates"),
+               run=data.get("run"), error=data.get("error"),
+               stats={k: (data.get("stats") or {}).get(k) for k in (
+                   "duration_s", "cost_turn_usd", "calls_total", "calls_mcp", "max_mcp_call_s",
+                   "max_out_chars", "pending_end", "permission_denials")})
+    return out
+
+
+def _verify_thread(snap):
+    verify_state["running"] += 1
+    try:
+        res = run_verify(snap)
+        _store_verify(snap["brief_id"], res)
+        if not res.get("available"):
+            return
+        reds = [g for g in res.get("gates") or [] if g.get("status") == "fail"]
+        log("verify do brief %s: %s (%d gate(s) vermelho(s)); run=%s"
+            % (snap["brief_id"], res.get("overall") or res.get("error"), len(reds), res.get("run")))
+        if res.get("error") or reds:
+            bridge_alert("gates", "warn",
+                         "brief %s: %s" % (snap["brief_id"], res.get("error") or "; ".join(
+                             "%s: %s" % (g.get("id"), g.get("detalhe")) for g in reds)[:600]),
+                         brief_id=snap["brief_id"], overall=res.get("overall"), run=res.get("run"))
+    except Exception as e:  # o verify nunca derruba a ponte
+        log("verify do brief %s quebrou: %s" % (snap.get("brief_id"), e))
+    finally:
+        verify_state["running"] -= 1
+
+
+def schedule_verify(snap, wait=False):
+    """Dispara o verify em segundo plano (o reader nao espera um subprocesso)."""
+    if not snap or not snap.get("stream_path"):
+        return None
+    t = threading.Thread(target=_verify_thread, args=(snap,), daemon=True)
+    t.start()
+    if wait:
+        t.join(VERIFY_TIMEOUT_S + 5)
+    return t
+
+
+def pipeline_snapshot():
+    """O que o GET /pipeline devolve."""
+    repo = REPO_DIR
+    ts = turn_status()
+    out = {"repo": repo, "available": False,
+           "ponte": {"alive": claude_alive(), "session_id": session_id,
+                     "pending": len(pending_snapshot()),
+                     "turn_in_flight": ts["turn_in_flight"],
+                     "last_event_age_s": ts["last_event_age_s"],
+                     "verify_rodando": verify_state["running"] > 0,
+                     "ultimo_verify": verify_state["last"]}}
+    script = gates_script(repo)
+    if not script:
+        out["motivo"] = "repo sem %s" % GATES_REL
+        return out
+    try:
+        p = subprocess.run([sys.executable, script, "pipeline"], cwd=repo, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=PIPELINE_TIMEOUT_S, creationflags=SUB_NO_WINDOW,
+                           env=dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8"))
+        data = json.loads(p.stdout.strip().splitlines()[-1])
+        out.update(available=True, status=data.get("status"), runs=data.get("runs"))
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError) as e:
+        out["erro"] = "gates.py pipeline falhou: %s" % e
+    return out
 
 
 def turns_snapshot():
@@ -1148,6 +1380,8 @@ def respond_to_control(request_id, response):
         with pending_lock:
             pending.pop(request_id, None)
             pending_deadline.pop(request_id, None)
+        capture_turn_event({"type": "control_response", "request_id": request_id,
+                            "origem": "ponte", "ts": time.time()})
         log("control_response enviado: id=%s" % request_id)
     return ok
 
@@ -1652,6 +1886,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/turns":
             return self._json({"turns": turns_snapshot()})
 
+        if u.path == "/pipeline":
+            return self._json(pipeline_snapshot())
+
         if u.path == "/events":
             try:
                 since = int(q.get("since", ["0"])[0])
@@ -1716,6 +1953,9 @@ class Handler(BaseHTTPRequestHandler):
             if err:
                 return self._json({"ok": False, "error": err}, 400)
             queue = data.get("queue") is True
+            meta, err = parse_send_meta(data)
+            if err:
+                return self._json({"ok": False, "error": err}, 400)
             switching = needs_model_restart(requested, current_model)
             if turn_in_flight and claude_alive() and not switching and not queue:
                 return self._json({"ok": False, "error":
@@ -1747,12 +1987,15 @@ class Handler(BaseHTTPRequestHandler):
             queued = turn_in_flight and queue
             user_seq = push_event({"type": "user",
                                    "message": {"role": "user", "content": text}})
-            b = open_turn(user_seq, current_model, queued=queued)
+            b = open_turn(user_seq, current_model, queued=queued, meta=meta, text=text)
+            if not queued and not (meta.get("budget_min") and meta.get("budget_usd")):
+                log("turno %s sem budget_min/budget_usd: o gate B3 vai falhar no verify" % b["brief_id"])
             log("turno %s (%d chars; after_seq=%d; model=%s; brief=%s)"
                 % ("enfileirado" if queued else "iniciado", len(text), after_seq,
                    current_model or "default", b["brief_id"]))
             out = {"ok": True, "after_seq": after_seq, "brief_id": b["brief_id"],
-                   "queued": queued, **model_status()}
+                   "queued": queued, **model_status(),
+                   "budget": {"budget_min": b.get("budget_min"), "budget_usd": b.get("budget_usd")}}
             if login["status"] == "warning":
                 out["login_warning"] = ("login expira em %.1f dias (%s)"
                                         % (login["days_left"], login["expires_at"]))
