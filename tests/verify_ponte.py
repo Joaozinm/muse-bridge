@@ -632,6 +632,133 @@ def case_porta_ocupada():
         hold.close()
 
 
+# ---------------- log de eventos (F11, F12) ----------------
+def synth_log(path, n_lines, start_seq=1, pad=0, partial_every=0):
+    """events.jsonl sintetico no formato real (com stream_event no meio, como
+    o arquivo antigo). Escreve em blocos para ser rapido."""
+    chunk = []
+    with open(path, "w", encoding="utf-8") as f:
+        for i in range(n_lines):
+            s = start_seq + i
+            if partial_every and i % partial_every:
+                ev = {"type": "stream_event", "event": {"type": "content_block_delta",
+                      "delta": {"text": "x" * pad}}, "seq": s, "ts": 1.0}
+            else:
+                ev = {"type": "assistant", "message": {"content": [
+                      {"type": "text", "text": "y" * pad}]}, "seq": s, "ts": 1.0}
+            chunk.append(json.dumps(ev))
+            if len(chunk) >= 5000:
+                f.write("\n".join(chunk) + "\n")
+                chunk = []
+        if chunk:
+            f.write("\n".join(chunk) + "\n")
+
+
+def time_to_status(srv, port, limit=30):
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        try:
+            if http(port, "/status")[0] == 200:
+                return time.time() - t0
+        except OSError:
+            pass
+        if srv.poll() is not None:
+            raise AssertionError("a ponte saiu (rc=%s)" % srv.returncode)
+        time.sleep(0.05)
+    raise AssertionError("a ponte nao respondeu em %ss" % limit)
+
+
+def case_c14_rotacao():
+    port = 8734
+    tmp = make_tmp()
+    main = os.path.join(tmp, "events.jsonl")
+    synth_log(main, 20000, pad=100)  # ~3 MB, acima do limite de 1 MB
+    size0 = os.path.getsize(main)
+    with open(main, "rb") as f:
+        head0 = f.read(4096)
+    srv = start_server(tmp, port, {"STUB_EXP": iso(30), "BRIDGE_ROTATE_MB": "1"}, wait=False)
+    try:
+        dt = time_to_status(srv, port)
+        assert dt < 3, "partida levou %.1fs" % dt
+        st = http(port, "/status")[1]
+        assert st["last_seq"] >= 20000, st["last_seq"]
+        send_turn(port, {"text": "depois da rotacao"})
+        rot = [f for f in os.listdir(tmp) if f.startswith("events-2")]
+        assert len(rot) == 1, os.listdir(tmp)
+        rpath = os.path.join(tmp, rot[0])
+        assert os.path.getsize(rpath) >= size0, "arquivo rotacionado encolheu"
+        with open(rpath, "rb") as f:
+            assert f.read(4096) == head0, "inicio do arquivo antigo mudou"
+        with open(rpath, encoding="utf-8") as f:
+            seqs = [json.loads(l)["seq"] for l in f if l.strip()]
+        assert seqs[:20000] == list(range(1, 20001)), "perdeu linha na rotacao"
+        new = [json.loads(l)["seq"] for l in open(main, encoding="utf-8") if l.strip()]
+        assert new and min(new) > 20000 and len(new) < 50, new[:5]
+        print("   partida %.2fs; %s com %d linhas antigas intactas" % (dt, rot[0], 20000))
+    finally:
+        stop_server(srv)
+
+
+def case_trava_rotacao():
+    port = 8735
+    tmp = make_tmp()
+    main = os.path.join(tmp, "events.jsonl")
+    synth_log(main, 20000, pad=100)
+    with open(os.path.join(tmp, "rotation-hold.json"), "w") as f:
+        f.write('{"reason": "D5"}')
+    srv = start_server(tmp, port, {"STUB_EXP": iso(30), "BRIDGE_ROTATE_MB": "1"})
+    try:
+        send_turn(port, {"text": "nao rotaciona"})
+        assert not [f for f in os.listdir(tmp) if f.startswith("events-2")], os.listdir(tmp)
+        st = http(port, "/status")[1]
+        assert st["log_files"]["rotation_hold"] is True, st["log_files"]
+    finally:
+        stop_server(srv)
+
+
+def case_c16_lacuna():
+    port = 8736
+    tmp = make_tmp()
+    synth_log(os.path.join(tmp, "events.jsonl"), 100)
+    srv = start_server(tmp, port, {"STUB_EXP": iso(30), "BRIDGE_MAX_EVENTS": "50"})
+    try:
+        code, r = http(port, "/events?since=10&timeout=0")
+        assert code == 200 and r["gap"] is True, r.keys()
+        # janela de 50: os 100 sinteticos + o init do stub -> comeca em 51 ou 52
+        assert r["first_seq"] in (51, 52) and r["events"][0]["seq"] == r["first_seq"], (
+            r["first_seq"], r["events"][0]["seq"])
+        code, r = http(port, "/events?since=80&timeout=0")
+        assert "gap" not in r and r["events"][0]["seq"] == 81, r.keys()
+    finally:
+        stop_server(srv)
+
+
+def case_partida_1gb():
+    port = 8737
+    tmp = make_tmp()
+    main = os.path.join(tmp, "events.jsonl")
+    t0 = time.time()
+    synth_log(main, 1_350_000, pad=700, partial_every=7)
+    size = os.path.getsize(main)
+    assert size >= 1024 ** 3, "sintetico com %.0f MB" % (size / 1048576)
+    gen = time.time() - t0
+    try:
+        srv = start_server(tmp, port, {"STUB_EXP": iso(30)}, wait=False)
+        try:
+            dt = time_to_status(srv, port)
+            st = http(port, "/status")[1]
+            assert st["last_seq"] >= 1_350_000, st["last_seq"]
+            assert st["events"] == 5000, st["events"]
+            assert dt < 3, "partida com %.0f MB levou %.2fs" % (size / 1048576, dt)
+            print("   %.0f MB (gerado em %.0fs): partida em %.2fs" % (size / 1048576, gen, dt))
+        finally:
+            stop_server(srv)
+    finally:
+        for f in os.listdir(tmp):  # arquivo sintetico do proprio teste
+            if f.startswith("events"):
+                os.remove(os.path.join(tmp, f))
+
+
 if __name__ == "__main__":
     ok = all([
         run_case("negacoes listadas (log + /status + /turns)", 8711,
@@ -689,5 +816,12 @@ if __name__ == "__main__":
                    case_resume_invalido),
         run_custom("partida: porta ocupada -> sai sem abrir claude (F21)",
                    case_porta_ocupada),
+        run_custom("log C14: acima do limite -> renomeia sem perda; partida < 3s",
+                   case_c14_rotacao),
+        run_custom("log: rotation-hold.json suspende a rotacao (D5)", case_trava_rotacao),
+        run_custom("log C16: since anterior a janela -> gap: true + first_seq",
+                   case_c16_lacuna),
+        run_custom("log: partida com events.jsonl sintetico de 1 GB < 3s",
+                   case_partida_1gb),
     ])
     sys.exit(0 if ok else 1)

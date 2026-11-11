@@ -23,7 +23,8 @@ Endpoints:
                                      409 se ha turno em voo (salvo "queue": true)
   POST /interrupt   {"reason": "...", "force": bool} -> interrompe o turno em voo
                                      (409 sem turno em voo, salvo "force": true)
-  GET  /events?since=N&timeout=S     -> {"events":[...]} (long-poll)
+  GET  /events?since=N&timeout=S     -> {"events":[...]} (long-poll); com since
+                                        anterior a janela: + "gap":true,"first_seq","last_seq"
   GET  /transcript                   -> pagina com a transcricao ao vivo
   GET  /pending                      -> {"pending":[...]} (control_requests sem resposta)
   POST /respond {"request_id": "...", "response": {...}} -> {"ok":true}
@@ -91,7 +92,7 @@ try:
 except Exception:
     pass
 
-MAX_EVENTS = 5000
+MAX_EVENTS = int(os.environ.get("BRIDGE_MAX_EVENTS", "5000"))
 
 
 def log(msg):
@@ -110,8 +111,65 @@ events_lock = threading.Lock()
 next_seq = 1
 
 
+# ---- log em disco (F11): parciais em arquivo proprio, rotacao por tamanho ----
+# Os `stream_event` (--include-partial-messages) eram ~85% das linhas do
+# events.jsonl. Eles continuam na memoria e no /events, mas no disco vao para
+# events-partial.jsonl. Passando de ROTATE_BYTES, o arquivo e RENOMEADO
+# (events-AAAAMMDD-HHMMSS.jsonl); nada e apagado. Com rotation-hold.json
+# presente, a rotacao fica suspensa (decisao D5 do Joao sobre o arquivo antigo).
+PARTIAL_PATH = os.path.join(BRIDGE_DIR, "events-partial.jsonl")
+HOLD_PATH = os.path.join(BRIDGE_DIR, "rotation-hold.json")
+ROTATE_BYTES = int(float(os.environ.get("BRIDGE_ROTATE_MB", "200")) * 1024 * 1024)
+file_lock = threading.Lock()
+_file_size = {}
+_hold_logged = set()
+
+
+def event_path(ev):
+    return PARTIAL_PATH if ev.get("type") == "stream_event" else JSONL_PATH
+
+
+def rotated_name(path, now=None):
+    base, ext = os.path.splitext(path)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now or time.time()))
+    cand = "%s-%s%s" % (base, stamp, ext)
+    i = 1
+    while os.path.exists(cand):
+        i += 1
+        cand = "%s-%s-%d%s" % (base, stamp, i, ext)
+    return cand
+
+
+def _maybe_rotate_locked(path):
+    size = _file_size.get(path)
+    if size is None:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        _file_size[path] = size
+    if size <= ROTATE_BYTES:
+        return None
+    if os.path.exists(HOLD_PATH):
+        if path not in _hold_logged:
+            _hold_logged.add(path)
+            log("!!! %s tem %.0f MB (> %.0f MB) mas a rotacao esta suspensa por %s"
+                % (os.path.basename(path), size / 1048576.0, ROTATE_BYTES / 1048576.0,
+                   HOLD_PATH))
+        return None
+    dest = rotated_name(path)
+    try:
+        os.rename(path, dest)  # renomeia; nunca apaga
+    except OSError as e:
+        log("rotacao de %s falhou: %s" % (path, e))
+        _file_size[path] = 0  # tenta de novo depois de mais ROTATE_BYTES
+        return None
+    _file_size[path] = 0
+    return dest
+
+
 def push_event(ev):
-    """Guarda o evento na memoria e no JSONL (historico sobrevive a restart)."""
+    """Guarda o evento na memoria e no disco (historico sobrevive a restart)."""
     global next_seq
     with events_lock:
         ev["seq"] = next_seq
@@ -120,36 +178,86 @@ def push_event(ev):
         events.append(ev)
         if len(events) > MAX_EVENTS:
             del events[:len(events) - MAX_EVENTS]
-    try:
-        with open(JSONL_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-    except OSError as e:
-        log("JSONL falhou: %s" % e)
+    line = (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
+    path = event_path(ev)
+    rotated = None
+    with file_lock:
+        try:
+            with open(path, "ab") as f:
+                f.write(line)
+            _file_size[path] = _file_size.get(path, 0) + len(line) \
+                if path in _file_size else os.path.getsize(path)
+            rotated = _maybe_rotate_locked(path)
+        except OSError as e:
+            log("JSONL falhou: %s" % e)
+    if rotated:
+        log("log de eventos rotacionado: %s -> %s" % (path, rotated))
     return ev["seq"]
 
 
-def replay_jsonl():
-    """Recarrega o historico do disco na memoria (apos restart do servidor)."""
-    global next_seq
+def tail_lines(path, n, block=1 << 20):
+    """As ultimas n linhas do arquivo, lendo de tras para frente (nao le o
+    arquivo inteiro: a partida com 930 MB levava 36 s). -> lista de bytes."""
     try:
-        with open(JSONL_PATH, encoding="utf-8") as f:
-            lines = f.readlines()[-MAX_EVENTS:]
+        f = open(path, "rb")
     except OSError:
-        return 0
-    n = 0
-    with events_lock:
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
+        return []
+    with f:
+        end = f.seek(0, 2)
+        pos, buf = end, b""
+        while pos > 0 and buf.count(b"\n") <= n:
+            step = min(block, pos)
+            pos -= step
+            f.seek(pos)
+            buf = f.read(step) + buf
+        lines = buf.split(b"\n")
+        if pos > 0:
+            lines = lines[1:]  # primeira linha pode estar cortada
+        return [l for l in lines if l.strip()][-n:]
+
+
+def replay_jsonl():
+    """Recarrega o fim do historico (principal + parciais) na memoria."""
+    global next_seq
+    loaded = []
+    for path in (JSONL_PATH, PARTIAL_PATH):
+        for raw in tail_lines(path, MAX_EVENTS):
             try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
+                ev = json.loads(raw.decode("utf-8", errors="replace"))
+            except ValueError:
                 continue
-            events.append(ev)
-            next_seq = max(next_seq, ev.get("seq", 0) + 1)
-            n += 1
-    return n
+            if isinstance(ev, dict) and isinstance(ev.get("seq"), int):
+                loaded.append(ev)
+    loaded.sort(key=lambda e: e["seq"])
+    loaded = loaded[-MAX_EVENTS:]
+    with events_lock:
+        events.extend(loaded)
+        for ev in loaded:
+            next_seq = max(next_seq, ev["seq"] + 1)
+    return len(loaded)
+
+
+def events_since(since):
+    """-> (eventos com seq > since, info de lacuna). Lacuna = o poller pediu a
+    partir de um ponto que ja saiu da janela de MAX_EVENTS (F12)."""
+    with events_lock:
+        out = [e for e in events if e["seq"] > since]
+        first = events[0]["seq"] if events else None
+        last = next_seq - 1
+    gap = first is not None and since + 1 < first
+    return out, {"gap": gap, "first_seq": first, "last_seq": last}
+
+
+def log_files_status():
+    out = {}
+    for name, path in (("events", JSONL_PATH), ("partial", PARTIAL_PATH)):
+        try:
+            out[name + "_mb"] = round(os.path.getsize(path) / 1048576.0, 1)
+        except OSError:
+            out[name + "_mb"] = 0
+    out["rotate_mb"] = round(ROTATE_BYTES / 1048576.0, 1)
+    out["rotation_hold"] = os.path.exists(HOLD_PATH)
+    return out
 
 
 # ---------------- control_requests pendentes ----------------
@@ -1538,6 +1646,7 @@ class Handler(BaseHTTPRequestHandler):
                                "login": dict(login_state),
                                "last_turn": (turns_snapshot() or [None])[-1],
                                **turn_status(),
+                               "log_files": log_files_status(),
                                **model_status()})
 
         if u.path == "/turns":
@@ -1553,13 +1662,13 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 timeout = 25
             deadline = time.time() + timeout
-            out = []
             while True:
-                with events_lock:
-                    out = [e for e in events if e["seq"] > since]
+                out, info = events_since(since)
                 if out or time.time() >= deadline:
                     break
                 time.sleep(0.4)
+            if info["gap"]:  # o poller perdeu eventos: dizer, nao esconder (F12)
+                return self._json({"events": out, **info})
             return self._json({"events": out})
 
         if u.path == "/transcript":

@@ -130,6 +130,22 @@ background terminou). Prazos (decisão D4 do João):
   stderr para `~/.muse-bridge/task-stderr.log`. Vale a partir da próxima
   execução do `Install.ps1`.
 
+## Log de eventos (F11, F12)
+
+- Na partida, a ponte lê só o **fim** dos arquivos (últimos 5.000 eventos):
+  0,02 s no `events.jsonl` real de 930 MB, contra 36 s antes.
+- Os `stream_event` (parciais de `--include-partial-messages`) continuam na
+  memória e no `/events`, mas no disco vão para `events-partial.jsonl`.
+- Passando de 200 MB (`BRIDGE_ROTATE_MB`), o arquivo é **renomeado** para
+  `events-AAAAMMDD-HHMMSS.jsonl` (ou `events-partial-…`). Nada é apagado.
+- `~/.muse-bridge/rotation-hold.json` presente = rotação suspensa. Ele foi
+  criado em 11/11 porque o destino do `events.jsonl` antigo de 930 MB ainda é
+  decisão do João (D5). Para liberar a rotação, apague esse arquivo.
+- `/events?since=N` com `N` anterior à janela da memória devolve, além de
+  `events`, `"gap": true`, `first_seq` e `last_seq`. Sem lacuna, a resposta
+  é a mesma de antes (`{"events": [...]}`).
+- `/status.log_files` traz o tamanho dos arquivos, o limite e se há trava.
+
 ## Auto-diagnóstico
 
 Quando a Muse detecta um travamento (sem eventos novos por minutos, ou
