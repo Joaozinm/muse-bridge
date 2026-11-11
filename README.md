@@ -81,6 +81,36 @@ Quem despacha escolhe o modelo de cada turno com o campo `model` do
   do processo; `null` = default do CLI), `model_cli` (o que o CLI informou no
   `init`) e `model_fallback`.
 
+## Vigia de turno (F02, F06, F13, F23 da auditoria)
+
+Um **turno** é um brief: tudo o que um `/send` dispara, inclusive os
+`result` extras de quando o CLI volta a trabalhar sozinho (uma tarefa em
+background terminou). Prazos (decisão D4 do João):
+
+| Situação | Aviso | Ação |
+|---|---|---|
+| Nenhum evento com turno em voo | 120 s (`bridge_alert` `silencio`, com nº de pendências e screenshot) | 300 s: `interrupt`, turno `stalled` |
+| Chamada MCP (`mcp__*`) em voo | 30 s (`mcp_lenta`) | 120 s: `interrupt`, turno `mcp_longa` |
+| Duração do turno | — | 45 min: `interrupt`, turno `teto` |
+| Interrupt sem `result` em 15 s | — | turno fechado com `cost_turn_usd: null`, `cost_reason: "sem result"` |
+| Processo do `claude` morreu | — | turno `morto` |
+
+- `/send` com turno em voo devolve **409**. Para enfileirar de propósito:
+  `"queue": true` (a mensagem entra no mesmo brief).
+- `POST /interrupt` `{"reason": "..."}` interrompe o turno em voo (409 se não
+  houver, a menos que `"force": true`). A ponte nunca reenvia o brief.
+- `result` com tarefa em background aberta não fecha o turno: ele fica
+  `esperando_background` até a tarefa terminar e vir o próximo `result`.
+- Custo: o `total_cost_usd` do CLI é acumulado **por processo** (zera
+  quando o processo sobe de novo, mesmo com `--resume`). A ponte publica
+  `cost_turn_usd` (delta, somado por brief) e `cost_session_usd` (o valor
+  cru) em `/turns` e `/status.last_turn`.
+- `/status` traz `turn_in_flight`, `turn` (brief, idade, estado, results),
+  `last_event_age_s`, `tool_in_flight`, `background_tasks` e `limits`.
+- Os prazos podem ser mudados por env (`BRIDGE_SILENCE_WARN_S`,
+  `BRIDGE_SILENCE_KILL_S`, `BRIDGE_TURN_MAX_S`, `BRIDGE_MCP_WARN_S`,
+  `BRIDGE_MCP_KILL_S`), mas o valor de produção é o da tabela.
+
 ## Auto-diagnóstico
 
 Quando a Muse detecta um travamento (sem eventos novos por minutos, ou
@@ -97,8 +127,9 @@ Screenshots são usados só para depurar o trabalho do agente.
 | Rota | Uso |
 |---|---|
 | `GET /health` | servidor vivo? sessão viva? |
-| `GET /status` | sessão, eventos, pendências, uptime, repo atual, `model`, `model_fallback` |
-| `POST /send` | `{"text": "...", "model": "fable"}` → manda tarefa (`model` opcional, ver abaixo) |
+| `GET /status` | sessão, eventos, pendências, uptime, repo atual, `model`, `model_fallback`, `turn_in_flight`, `turn`, `last_event_age_s`, `tool_in_flight` |
+| `POST /send` | `{"text": "...", "model": "fable", "queue": false}` → manda tarefa (`model` e `queue` opcionais); 409 com turno em voo |
+| `POST /interrupt` | `{"reason": "..."}` → interrompe o turno em voo |
 | `GET /events` | `?since=N&timeout=S` → long-poll de eventos |
 | `GET /transcript` | página ao vivo |
 | `GET /pending` | control_requests sem resposta |

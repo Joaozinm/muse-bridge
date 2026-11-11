@@ -87,6 +87,31 @@ for line in sys.stdin:
         continue
     if os.environ.get("STUB_HOLD") == "1":
         continue
+    if os.environ.get("STUB_MCP_HANG") == "1":  # chamada MCP que nunca volta
+        out({"type": "assistant", "message": {"content": [{"type": "tool_use",
+             "id": "toolu_mcp1", "name": "mcp__blender-community__execute_blender_code",
+             "input": {"code": "import time; time.sleep(200)"}}]}})
+        continue
+    slow = float(os.environ.get("STUB_SLOW", "0"))
+    if slow:  # lento mas vivo: batimento a cada 0,3 s
+        end = time.time() + slow
+        while time.time() < end:
+            out({"type": "tool_progress", "tool_use_id": "toolu_b", "elapsed_time_seconds": 1})
+            time.sleep(0.3)
+    if os.environ.get("STUB_REENTRY") == "1":  # F23: result, background, result
+        out({"type": "system", "subtype": "task_started", "task_id": "bg1",
+             "is_backgrounded": True, "description": "build"})
+        out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 5,
+             "result": "o build esta rodando, o Monitor me avisa", "session_id": sid,
+             "total_cost_usd": 1.06, "permission_denials": []})
+        time.sleep(float(os.environ.get("STUB_REENTRY_S", "1.5")))
+        out({"type": "system", "subtype": "task_notification", "task_id": "bg1",
+             "status": "completed"})
+        out({"type": "assistant", "message": {"content": [{"type": "text", "text": "pronto"}]}})
+        out({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 5,
+             "result": "build ok", "session_id": sid, "total_cost_usd": 3.08,
+             "permission_denials": []})
+        continue
     ev = {"type": "result", "subtype": "success", "is_error": False,
           "duration_ms": 5, "result": "ok", "session_id": sid}
     if model and model == os.environ.get("STUB_ERR_MODEL"):
@@ -377,6 +402,111 @@ def case_elicit_muse_answers(port, tmp):
     assert http(port, "/pending")[1]["pending"] == []
 
 
+# ---------------- vigia de turno (F02, F06, F13, F23) ----------------
+FAST_WATCH = {"BRIDGE_SILENCE_WARN_S": "1", "BRIDGE_SILENCE_KILL_S": "2.5",
+              "BRIDGE_CLOSE_GRACE_S": "1.5", "BRIDGE_ALERT_SCREENSHOT": "0"}
+
+
+def wait_closed(port, timeout=10):
+    def done():
+        st = http(port, "/status")[1]
+        return st if (not st["turn_in_flight"] and st.get("last_turn")
+                      and st["last_turn"].get("outcome")) else None
+    return wait_for(done, timeout, "turno fechado")
+
+
+def case_c8_send_em_voo(port, tmp):
+    code, r = http(port, "/send", {"text": "turno longo"})
+    assert code == 200 and r["queued"] is False, (code, r)
+    st = http(port, "/status")[1]
+    assert st["turn_in_flight"] is True and st["turn"]["brief_id"] == r["brief_id"], st
+    code, r2 = http(port, "/send", {"text": "atropelo"})
+    assert code == 409 and "turno em andamento" in r2["error"], (code, r2)
+    assert r2["turn_in_flight"] is True, r2
+    code, r3 = http(port, "/send", {"text": "de proposito", "queue": True})
+    assert code == 200 and r3["queued"] is True and r3["brief_id"] == r["brief_id"], (code, r3)
+    assert http(port, "/status")[1]["turn"]["expected_results"] == 2
+    code, r4 = http(port, "/interrupt", {"reason": "teste C8"})
+    assert code == 200 and r4["ok"], (code, r4)
+    st = wait_closed(port)
+    assert st["last_turn"]["outcome"] == "interrompido", st["last_turn"]
+    assert len(stub_log(tmp, "interrupts.jsonl")) == 1
+    code, r5 = http(port, "/interrupt", {})
+    assert code == 409, (code, r5)  # nada em voo
+    code, r6 = http(port, "/send", {"text": "depois"})
+    assert code == 200, (code, r6)
+
+
+def case_c9_sem_result(port, tmp):
+    t0 = time.time()
+    code, r = http(port, "/send", {"text": "trava"})
+    assert code == 200, (code, r)
+    st = wait_closed(port, 12)
+    dt = time.time() - t0
+    t = st["last_turn"]
+    assert t["outcome"] == "stalled", t
+    assert t["cost_turn_usd"] is None and t["cost_reason"] == "sem result", t
+    assert t["results"] == [], t
+    assert 3.5 <= dt <= 8, "fechou fora do prazo (2,5 + 1,5 s): %.1fs" % dt
+    assert len(stub_log(tmp, "interrupts.jsonl")) == 1
+    kinds = [a["kind"] for a in alerts(port)]
+    for k in ("silencio", "interrupt", "turno_fechado"):
+        assert k in kinds, (k, kinds)
+    code, r = http(port, "/send", {"text": "segue"})
+    assert code == 200, "depois do stalled a ponte aceita turno novo"
+    print("   stalled em %.1fs" % dt)
+
+
+def case_lento_vivo(port, tmp):
+    code, r = http(port, "/send", {"text": "build demorado"})
+    assert code == 200, (code, r)
+    st = wait_closed(port, 12)
+    assert st["last_turn"]["outcome"] == "concluido", st["last_turn"]
+    assert not stub_log(tmp, "interrupts.jsonl"), "lento com batimento nao e travado"
+    assert "silencio" not in [a["kind"] for a in alerts(port)]
+
+
+def case_mcp_longa(port, tmp):
+    code, r = http(port, "/send", {"text": "probe"})
+    assert code == 200, (code, r)
+    def tool():
+        st = http(port, "/status")[1]
+        return st["tool_in_flight"] or None
+    tf = wait_for(tool, 3, "ferramenta em voo no /status")
+    assert tf[0]["name"].startswith("mcp__blender-community"), tf
+    st = wait_closed(port, 10)
+    assert st["last_turn"]["outcome"] == "mcp_longa", st["last_turn"]
+    kinds = [a["kind"] for a in alerts(port)]
+    assert "mcp_lenta" in kinds and "interrupt" in kinds, kinds
+
+
+def case_teto(port, tmp):
+    code, r = http(port, "/send", {"text": "turno sem fim"})
+    assert code == 200, (code, r)
+    st = wait_closed(port, 12)
+    assert st["last_turn"]["outcome"] == "teto", st["last_turn"]
+    intr = wait_for(lambda: stub_log(tmp, "interrupts.jsonl"), 8, "interrupt lido pelo stub")
+    assert len(intr) == 1, intr
+
+
+def case_reentrada(port, tmp):
+    code, r = http(port, "/send", {"text": "build em background"})
+    assert code == 200, (code, r)
+    def waiting():
+        st = http(port, "/status")[1]
+        return st if (st["turn"] or {}).get("state") == "esperando_background" else None
+    st = wait_for(waiting, 3, "brief esperando background")
+    assert st["turn_in_flight"] is True and st["background_tasks"] == 1, st
+    code, r2 = http(port, "/send", {"text": "acho que acabou"})
+    assert code == 409, "result com background aberto nao libera o /send"
+    st = wait_closed(port, 6)
+    t = st["last_turn"]
+    assert len(t["results"]) == 2 and t["outcome"] == "concluido", t
+    assert abs(t["cost_turn_usd"] - 3.08) < 1e-6, t
+    assert [round(x["cost_turn_usd"], 2) for x in t["results"]] == [1.06, 2.02], t
+    assert len(http(port, "/turns")[1]["turns"]) == 1, "um brief, uma entrada"
+
+
 if __name__ == "__main__":
     ok = all([
         run_case("negacoes listadas (log + /status + /turns)", 8711,
@@ -410,5 +540,21 @@ if __name__ == "__main__":
         run_case("elicitation: Muse responde no prazo -> nada e cancelado", 8723,
                  {"STUB_EXP": iso(30), "STUB_ELICIT": "unknown",
                   "BRIDGE_ELICIT_WAIT_S": "2"}, case_elicit_muse_answers),
+        run_case("vigia C8: /send em voo -> 409; queue:true entra; /interrupt", 8724,
+                 {"STUB_EXP": iso(30), "STUB_HOLD": "1"}, case_c8_send_em_voo),
+        run_case("vigia C9: claude sem result -> stalled, custo null 'sem result'", 8725,
+                 dict(FAST_WATCH, STUB_EXP=iso(30), STUB_HOLD="1",
+                      STUB_INTERRUPT_RESULT="0"), case_c9_sem_result),
+        run_case("vigia: claude lento com batimento nao e interrompido", 8726,
+                 dict(FAST_WATCH, STUB_EXP=iso(30), STUB_SLOW="4"), case_lento_vivo),
+        run_case("vigia: chamada MCP passa do corte -> interrupt (U1)", 8727,
+                 dict(FAST_WATCH, STUB_EXP=iso(30), STUB_MCP_HANG="1",
+                      BRIDGE_SILENCE_WARN_S="60", BRIDGE_SILENCE_KILL_S="60",
+                      BRIDGE_MCP_WARN_S="0.5", BRIDGE_MCP_KILL_S="1.5"), case_mcp_longa),
+        run_case("vigia: teto duro por turno -> interrupt", 8728,
+                 dict(FAST_WATCH, STUB_EXP=iso(30), STUB_SLOW="5",
+                      BRIDGE_TURN_MAX_S="1.5"), case_teto),
+        run_case("vigia F23: result com background aberto -> mesmo brief, custo em delta", 8729,
+                 dict(FAST_WATCH, STUB_EXP=iso(30), STUB_REENTRY="1"), case_reentrada),
     ])
     sys.exit(0 if ok else 1)

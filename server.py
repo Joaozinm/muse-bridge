@@ -14,9 +14,15 @@ Env:  CLAUDE_EXE  (padrao: ~/.local/bin/claude.exe)
 Endpoints:
   GET  /health                       -> {"ok":true,"session":"alive"|"dead",...}
   GET  /status                       -> {"alive":...,"session_id":...,"pending":N,"repo":...,
-                                        "model":...,"model_fallback":...}
-  POST /send        {"text": "...", "model": "fable"|"opus"|<id>}  (model opcional)
-                                     -> {"ok":true,"after_seq":N,"model":...}
+                                        "model":...,"model_fallback":...,
+                                        "turn_in_flight":..,"turn":{...},
+                                        "last_event_age_s":..,"tool_in_flight":[...],
+                                        "background_tasks":N,"limits":{...}}
+  POST /send        {"text": "...", "model": "fable"|"opus"|<id>, "queue": bool}
+                                     -> {"ok":true,"after_seq":N,"brief_id":N,"queued":..,"model":...}
+                                     409 se ha turno em voo (salvo "queue": true)
+  POST /interrupt   {"reason": "...", "force": bool} -> interrompe o turno em voo
+                                     (409 sem turno em voo, salvo "force": true)
   GET  /events?since=N&timeout=S     -> {"events":[...]} (long-poll)
   GET  /transcript                   -> pagina com a transcricao ao vivo
   GET  /pending                      -> {"pending":[...]} (control_requests sem resposta)
@@ -284,8 +290,9 @@ def expire_pending(now=None):
                      % (req.get("subtype"), req.get("mcp_server_name") or "claude",
                         ELICIT_WAIT_S, json.dumps(resp) if resp else "sem resposta"),
                      request_id=rid, response=resp, ok=ok)
-        interrupt_turn("control_request %s sem resposta (D3: cancelar e encerrar)"
-                       % rid)
+        why = "control_request %s sem resposta (D3: cancelar e encerrar)" % rid
+        mark_interrupt("elicitation", why)
+        interrupt_turn(why)
 
 
 # ---------------- permissoes negadas por turno ----------------
@@ -309,8 +316,8 @@ def summarize_denial(item):
 
 
 def record_turn(ev, seq):
-    """Registra o turno concluido e suas negacoes (log + /status + /turns).
-    Nunca levanta excecao: falhar aqui nao pode derrubar o reader."""
+    """Resumo de UM result e log das negacoes dele. O agrupamento por brief
+    (varios results do mesmo /send) fica em on_result. Nunca levanta."""
     raw = ev.get("permission_denials")
     reported = isinstance(raw, list)
     denials = raw if reported else None
@@ -329,15 +336,339 @@ def record_turn(ev, seq):
             log("!!!   negacao %d/%d: %s" % (i, len(denials), summarize_denial(item)))
     else:
         log("permissoes negadas: 0 (seq=%s)" % seq)
-    with turns_lock:
-        turns.append(turn)
-        del turns[:-MAX_TURNS]
     return turn
 
 
+# ---------------- turno em voo, vigia e custo (F02, F06, F13, F23) ----------------
+# Um "turno" aqui e um BRIEF: tudo o que acontece entre um /send e o fim do
+# trabalho que ele disparou, inclusive os `result` extras de quando o CLI
+# reentra sozinho (tarefa em background terminou: F23, seq 1333463-1336736).
+# Prazos (decisao D4 do Joao); env so para os testes.
+SILENCE_WARN_S = float(os.environ.get("BRIDGE_SILENCE_WARN_S", "120"))
+SILENCE_KILL_S = float(os.environ.get("BRIDGE_SILENCE_KILL_S", "300"))
+TURN_MAX_S = float(os.environ.get("BRIDGE_TURN_MAX_S", str(45 * 60)))
+MCP_WARN_S = float(os.environ.get("BRIDGE_MCP_WARN_S", "30"))
+MCP_KILL_S = float(os.environ.get("BRIDGE_MCP_KILL_S", "120"))
+CLOSE_GRACE_S = float(os.environ.get("BRIDGE_CLOSE_GRACE_S", "15"))
+ALERT_SCREENSHOT = os.environ.get("BRIDGE_ALERT_SCREENSHOT", "1") == "1"
+
+turn_lock = threading.RLock()
+cur_turn = None          # brief em voo (dict) ou None
+last_brief = None        # ultimo brief (aberto ou fechado), para reentradas
+last_event_ts = None     # epoch do ultimo evento do claude (batimento)
+tools_in_flight = {}     # tool_use_id -> {"name","ts","seq"}
+bg_tasks = {}            # task_id -> {"description","ts"} (is_backgrounded)
+_brief_n = [0]
+# total_cost_usd do CLI e ACUMULADO POR PROCESSO (zera quando o processo sobe
+# de novo, mesmo com --resume: 19,51 -> 4,04 na sessao 9aeaf055). A base zera
+# em todo spawn.
+cost_base = {"last_total": None}
+
+
+def cost_delta(prev_total, total):
+    """-> custo deste result. Pura. total menor que o anterior = contador zerou."""
+    if not isinstance(total, (int, float)) or isinstance(total, bool):
+        return None
+    if prev_total is None or total < prev_total - 1e-9:
+        return round(float(total), 6)
+    return round(float(total) - prev_total, 6)
+
+
+def _new_brief(brief_seq, model, queued_from=None):
+    _brief_n[0] += 1
+    now = time.time()
+    return {"brief_id": _brief_n[0], "brief_seq": brief_seq,
+            "started_ts": now, "model": model, "state": "running",
+            "expected_results": 1, "results": [], "reentries": 0,
+            "outcome": None, "reason": None, "closed_ts": None,
+            "duration_s": None, "cost_turn_usd": None,
+            "cost_session_usd": None, "cost_reason": None,
+            "interrupt_ts": None, "interrupt_outcome": None,
+            "warned": {}, "in_list": False,
+            # campos do formato antigo de /turns (ultimo result)
+            "seq": None, "ts": now, "session_id": session_id,
+            "subtype": None, "is_error": None, "denials_reported": None,
+            "permission_denials": None, "denials_count": None}
+
+
+def _publish_locked(b):
+    """Garante o brief em /turns (uma entrada por brief)."""
+    if not b["in_list"]:
+        with turns_lock:
+            turns.append(b)
+            del turns[:-MAX_TURNS]
+        b["in_list"] = True
+
+
+def open_turn(brief_seq, model, queued=False):
+    """Chamado pelo /send. Com queue=True e turno em voo, a mensagem entra no
+    brief atual (mais um result esperado). -> o brief."""
+    global cur_turn, last_brief, turn_in_flight, last_event_ts
+    with turn_lock:
+        if cur_turn is not None and queued:
+            cur_turn["expected_results"] += 1
+            return cur_turn
+        b = _new_brief(brief_seq, model)
+        cur_turn = last_brief = b
+        turn_in_flight = True
+        last_event_ts = time.time()
+        return b
+
+
+def _close_locked(b, outcome, reason, now=None):
+    global cur_turn, turn_in_flight
+    now = time.time() if now is None else now
+    b.update(outcome=outcome, reason=reason, closed_ts=now, state="fechado",
+             duration_s=round(now - b["started_ts"], 1))
+    if not b["results"]:
+        b["cost_turn_usd"] = None
+        b["cost_reason"] = "sem result"
+    _publish_locked(b)
+    if cur_turn is b:
+        cur_turn = None
+        turn_in_flight = False
+        tools_in_flight.clear()
+
+
+def close_turn(outcome, reason, alert_level="action"):
+    """Fecha o brief em voo (se houver) e avisa. -> o brief fechado ou None."""
+    with turn_lock:
+        b = cur_turn
+        if b is None:
+            return None
+        _close_locked(b, outcome, reason)
+        snap = turn_public(b)
+    log("turno fechado: brief=%s desfecho=%s motivo=%s custo=%s"
+        % (snap["brief_id"], outcome, reason, snap["cost_turn_usd"]))
+    if alert_level:
+        bridge_alert("turno_fechado", alert_level,
+                     "turno %s fechado como %s: %s" % (snap["brief_id"], outcome, reason),
+                     brief_id=snap["brief_id"], outcome=outcome,
+                     cost_turn_usd=snap["cost_turn_usd"],
+                     cost_reason=snap["cost_reason"])
+    return snap
+
+
+def mark_interrupt(outcome, reason):
+    """Registra no brief em voo que a ponte pediu interrupt (o fechamento vem
+    com o result, ou pelo vigia depois de CLOSE_GRACE_S)."""
+    with turn_lock:
+        b = cur_turn
+        if b is not None and b["interrupt_ts"] is None:
+            b["interrupt_ts"] = time.time()
+            b["interrupt_outcome"] = outcome
+            b["reason"] = reason
+
+
+def on_stream_event(ev, seq):
+    """Batimento, ferramentas em voo e tarefas em background. Nunca levanta."""
+    global last_event_ts, cur_turn
+    now = time.time()
+    etype = ev.get("type")
+    reopened = None
+    with turn_lock:
+        last_event_ts = now
+        if etype == "assistant":
+            content = (ev.get("message") or {}).get("content")
+            for blk in content if isinstance(content, list) else []:
+                if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                    tools_in_flight[blk.get("id")] = {
+                        "name": blk.get("name"), "ts": now, "seq": seq}
+            # F23: o CLI voltou a trabalhar sem /send -> o brief reabre
+            if cur_turn is None and last_brief is not None:
+                b = last_brief
+                b.update(state="running", outcome=None, closed_ts=None,
+                         interrupt_ts=None, interrupt_outcome=None)
+                b["reentries"] += 1
+                b["expected_results"] = len(b["results"]) + 1
+                cur_turn = b
+                globals()["turn_in_flight"] = True
+                reopened = b["brief_id"]
+        elif etype == "user":
+            content = (ev.get("message") or {}).get("content")
+            for blk in content if isinstance(content, list) else []:
+                if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                    tools_in_flight.pop(blk.get("tool_use_id"), None)
+        elif etype == "system":
+            st = ev.get("subtype")
+            if st == "task_started" and ev.get("is_backgrounded"):
+                bg_tasks[ev.get("task_id")] = {
+                    "description": ev.get("description"), "ts": now}
+            elif st == "task_notification":
+                bg_tasks.pop(ev.get("task_id"), None)
+                b = cur_turn
+                if (b is not None and b["state"] == "esperando_background"
+                        and not bg_tasks):
+                    b["state"] = "running"
+    if reopened is not None:
+        log("turno %s reaberto: o claude voltou a trabalhar sem /send (reentrada)"
+            % reopened)
+
+
+def on_result(ev, seq):
+    """Agrupa o result no brief, calcula o custo em delta e decide se o
+    brief acabou (F13, F23). Nunca levanta (o reader protege)."""
+    summary = record_turn(ev, seq)
+    total = ev.get("total_cost_usd")
+    with turn_lock:
+        delta = cost_delta(cost_base["last_total"], total)
+        if isinstance(total, (int, float)):
+            cost_base["last_total"] = float(total)
+        b = cur_turn
+        if b is None:  # result sem brief aberto (ex.: ponte reiniciou no meio)
+            b = last_brief if (last_brief is not None and last_brief["closed_ts"]
+                               and time.time() - last_brief["closed_ts"] < 5) else None
+            if b is None:
+                b = _new_brief(None, current_model)
+                b["reason"] = "result sem /send"
+        tools_in_flight.clear()
+        b["results"].append({"seq": seq, "subtype": ev.get("subtype"),
+                             "is_error": ev.get("is_error"),
+                             "duration_ms": ev.get("duration_ms"),
+                             "cost_turn_usd": delta,
+                             "cost_session_usd": total})
+        costs = [r["cost_turn_usd"] for r in b["results"]
+                 if r["cost_turn_usd"] is not None]
+        b["cost_turn_usd"] = round(sum(costs), 6) if costs else None
+        b["cost_reason"] = None if costs else "result sem total_cost_usd"
+        b["cost_session_usd"] = total
+        prev_d = b["permission_denials"] if b["results"][:-1] else []
+        if summary["denials_reported"] and (prev_d is not None):
+            denials = list(prev_d or []) + list(summary["permission_denials"])
+        else:
+            denials = None
+        b.update(seq=seq, ts=summary["ts"], session_id=summary["session_id"],
+                 subtype=summary["subtype"], is_error=summary["is_error"],
+                 denials_reported=denials is not None,
+                 permission_denials=denials,
+                 denials_count=len(denials) if denials is not None else None)
+        _publish_locked(b)
+        decision = None
+        if b is cur_turn:
+            if b["interrupt_ts"] is not None:
+                decision = (b["interrupt_outcome"], b["reason"])
+            elif len(b["results"]) >= b["expected_results"]:
+                if bg_tasks:
+                    b["state"] = "esperando_background"
+                else:
+                    decision = ("erro" if ev.get("is_error") else "concluido",
+                                "result %s" % ev.get("subtype"))
+        elif b["closed_ts"] is None:  # brief novo, sem /send: so registra
+            _close_locked(b, "erro" if ev.get("is_error") else "concluido",
+                          "result sem /send")
+    log("custo: turno=%s sessao=%s (seq=%s)" % (delta, total, seq))
+    if decision:
+        close_turn(decision[0], decision[1],
+                   alert_level=None if decision[0] in ("concluido", "erro") else "action")
+    return b
+
+
+def turn_public(b):
+    if b is None:
+        return None
+    out = {k: v for k, v in b.items() if k not in ("warned", "in_list")}
+    out["results"] = [dict(r) for r in b["results"]]
+    return out
+
+
+def turn_status(now=None):
+    """O que o /status mostra do turno em voo."""
+    now = time.time() if now is None else now
+    with turn_lock:
+        b = cur_turn
+        tools = [{"tool_use_id": k, "name": v["name"],
+                  "age_s": round(now - v["ts"], 1)}
+                 for k, v in tools_in_flight.items()]
+        out = {"turn_in_flight": b is not None,
+               "last_event_ts": last_event_ts,
+               "last_event_age_s": (round(now - last_event_ts, 1)
+                                    if last_event_ts else None),
+               "tool_in_flight": tools,
+               "background_tasks": len(bg_tasks),
+               "turn": None}
+        if b is not None:
+            t = turn_public(b)
+            t["age_s"] = round(now - b["started_ts"], 1)
+            out["turn"] = t
+        out["limits"] = {"silence_warn_s": SILENCE_WARN_S,
+                         "silence_kill_s": SILENCE_KILL_S,
+                         "turn_max_s": TURN_MAX_S, "mcp_warn_s": MCP_WARN_S,
+                         "mcp_kill_s": MCP_KILL_S,
+                         "elicit_wait_s": ELICIT_WAIT_S}
+        return out
+
+
+def reset_turn_on_spawn():
+    """Processo novo: o brief em voo (se houver) morreu com o anterior."""
+    global last_event_ts
+    if cur_turn is not None:
+        close_turn("interrompido", "sessao do claude reiniciada")
+    with turn_lock:
+        tools_in_flight.clear()
+        bg_tasks.clear()
+        cost_base["last_total"] = None
+        last_event_ts = time.time()
+
+
+def watch_turn(now=None):
+    """Um tique do vigia sobre o brief em voo. Decide fora do lock e age depois."""
+    now = time.time() if now is None else now
+    warn, kill, close = [], None, None
+    with turn_lock:
+        b = cur_turn
+        if b is None:
+            return
+        if not claude_alive():
+            close = ("morto", "processo do claude morreu com o turno em voo")
+        elif b["interrupt_ts"] is not None:
+            if now - b["interrupt_ts"] >= CLOSE_GRACE_S:
+                close = (b["interrupt_outcome"],
+                         "%s; sem result %.0fs depois do interrupt"
+                         % (b["reason"], CLOSE_GRACE_S))
+        else:
+            age = now - b["started_ts"]
+            silent = now - (last_event_ts or b["started_ts"])
+            if age >= TURN_MAX_S:
+                kill = ("teto", "teto duro de %.0f min por turno" % (TURN_MAX_S / 60))
+            elif b["state"] == "running" and silent >= SILENCE_KILL_S:
+                kill = ("stalled", "%.0fs sem nenhum evento" % silent)
+            elif b["state"] == "running":
+                if silent >= SILENCE_WARN_S and b["warned"].get("silence") != last_event_ts:
+                    b["warned"]["silence"] = last_event_ts
+                    warn.append(("silencio", "%.0fs sem evento com turno em voo "
+                                 "(interrupt em %.0fs)" % (silent, SILENCE_KILL_S),
+                                 {"silent_s": round(silent, 1)}))
+                for tid, t in list(tools_in_flight.items()):
+                    if not str(t["name"] or "").startswith("mcp__"):
+                        continue
+                    tage = now - t["ts"]
+                    if tage >= MCP_KILL_S:
+                        kill = ("mcp_longa", "chamada %s passou de %.0fs"
+                                % (t["name"], MCP_KILL_S))
+                        break
+                    if tage >= MCP_WARN_S and not b["warned"].get(tid):
+                        b["warned"][tid] = True
+                        warn.append(("mcp_lenta", "chamada %s em voo ha %.0fs (corte em %.0fs)"
+                                     % (t["name"], tage, MCP_KILL_S),
+                                     {"tool": t["name"], "tool_use_id": tid,
+                                      "age_s": round(tage, 1)}))
+    for kind, msg, extra in warn:
+        if kind == "silencio":
+            extra["pending"] = len(pending_snapshot())
+            if ALERT_SCREENSHOT:
+                extra["screenshot"] = "/screenshot" if take_screenshot() else None
+        bridge_alert(kind, "warn", msg, **extra)
+    if close:
+        close_turn(close[0], close[1])
+    elif kill:
+        mark_interrupt(kill[0], kill[1])
+        interrupt_turn(kill[1])
+
+
 def turns_snapshot():
-    with turns_lock:
-        return [dict(t) for t in turns]
+    with turn_lock:
+        with turns_lock:
+            return [turn_public(t) for t in turns]
 
 
 # ---------------- validade do login ----------------
@@ -592,7 +923,7 @@ def spawn_claude(model=None, resume=None):
         args += ["--model", model]
     current_model = model
     cli_model = None
-    turn_in_flight = False
+    reset_turn_on_spawn()
     log("iniciando claude (cwd=%s, model=%s, resume=%s)"
         % (REPO_DIR, model or "default", resume or "-"))
     err_log = open(ERR_PATH, "a", encoding="utf-8")
@@ -634,6 +965,11 @@ def reader_loop():
                 continue
             seq = push_event(ev)
             etype = ev.get("type")
+            if proc is claude_proc:
+                try:
+                    on_stream_event(ev, seq)
+                except Exception as e:  # vigia nunca derruba o reader
+                    log("falha no batimento (seq=%s): %s" % (seq, e))
             if etype == "system" and ev.get("subtype") == "init":
                 session_id = ev.get("session_id")
                 cli_model = ev.get("model") or cli_model
@@ -652,10 +988,11 @@ def reader_loop():
                 log("turno concluido: status=%s dur=%sms"
                     % ("done" if subtype == "success" else "error",
                        ev.get("duration_ms", 0)))
-                if proc is claude_proc:
-                    turn_in_flight = False
                 try:
-                    record_turn(ev, seq)
+                    if proc is claude_proc:
+                        on_result(ev, seq)
+                    else:
+                        record_turn(ev, seq)
                     login_from_result(ev)
                     if proc is claude_proc and is_model_error(ev):
                         fallback_after_model_error(ev)
@@ -746,6 +1083,7 @@ WATCH_TICK_S = float(os.environ.get("BRIDGE_WATCH_TICK_S", "1"))
 def watchdog_tick(now=None):
     now = time.time() if now is None else now
     expire_pending(now)
+    watch_turn(now)
 
 
 def watchdog_loop():
@@ -1049,6 +1387,7 @@ class Handler(BaseHTTPRequestHandler):
                                "repo": REPO_DIR,
                                "login": dict(login_state),
                                "last_turn": (turns_snapshot() or [None])[-1],
+                               **turn_status(),
                                **model_status()})
 
         if u.path == "/turns":
@@ -1117,7 +1456,13 @@ class Handler(BaseHTTPRequestHandler):
             requested, err = resolve_model(data.get("model"))
             if err:
                 return self._json({"ok": False, "error": err}, 400)
+            queue = data.get("queue") is True
             switching = needs_model_restart(requested, current_model)
+            if turn_in_flight and claude_alive() and not switching and not queue:
+                return self._json({"ok": False, "error":
+                                   "turno em andamento (use \"queue\": true para "
+                                   "enfileirar de proposito, ou POST /interrupt)",
+                                   **turn_status()}, 409)
             if not switching and not claude_alive():
                 return self._json({"ok": False, "error": "sessao morta"}, 500)
             login = check_login()
@@ -1140,12 +1485,15 @@ class Handler(BaseHTTPRequestHandler):
             if not send_to_claude(text):
                 return self._json({"ok": False,
                                    "error": "falha ao escrever no claude"}, 500)
-            turn_in_flight = True
-            push_event({"type": "user",
-                        "message": {"role": "user", "content": text}})
-            log("turno iniciado (%d chars; after_seq=%d; model=%s)"
-                % (len(text), after_seq, current_model or "default"))
-            out = {"ok": True, "after_seq": after_seq, **model_status()}
+            queued = turn_in_flight and queue
+            user_seq = push_event({"type": "user",
+                                   "message": {"role": "user", "content": text}})
+            b = open_turn(user_seq, current_model, queued=queued)
+            log("turno %s (%d chars; after_seq=%d; model=%s; brief=%s)"
+                % ("enfileirado" if queued else "iniciado", len(text), after_seq,
+                   current_model or "default", b["brief_id"]))
+            out = {"ok": True, "after_seq": after_seq, "brief_id": b["brief_id"],
+                   "queued": queued, **model_status()}
             if login["status"] == "warning":
                 out["login_warning"] = ("login expira em %.1f dias (%s)"
                                         % (login["days_left"], login["expires_at"]))
@@ -1163,6 +1511,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             return self._json({"ok": False,
                                "error": "falha ao escrever no claude"}, 500)
+
+        if u.path == "/interrupt":
+            if not claude_alive():
+                return self._json({"ok": False, "error": "sessao morta"}, 500)
+            if not turn_in_flight and data.get("force") is not True:
+                return self._json({"ok": False, "error": "sem turno em voo "
+                                   "(\"force\": true manda mesmo assim)"}, 409)
+            reason = str(data.get("reason") or "pedido via POST /interrupt")[:200]
+            mark_interrupt("interrompido", reason)
+            ok = interrupt_turn(reason)
+            return self._json({"ok": ok, **turn_status()}, 200 if ok else 500)
 
         if u.path == "/restart":
             restart_claude()
