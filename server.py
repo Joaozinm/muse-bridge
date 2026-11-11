@@ -23,6 +23,11 @@ Endpoints:
   POST /respond {"request_id": "...", "response": {...}} -> {"ok":true}
   GET  /screenshot                   -> PNG da tela principal
   GET  /logs?lines=N                 -> {"server": [...], "stderr": [...]}
+  GET  /file?path=<relativo ao repo> -> o arquivo (renders e textos do repo atual).
+                                        So png/jpg/jpeg/webp/gif/txt/md/json/log,
+                                        ate 20 MB. 400 path ausente/invalido,
+                                        403 fora da raiz do repo, 404 inexistente,
+                                        413 grande demais, 415 extensao nao servida.
   GET  /turns                        -> {"turns":[...]} ultimos turnos concluidos,
                                         com as permissoes negadas de cada um
   POST /restart                      -> mata o claude e comeca sessao nova
@@ -744,9 +749,82 @@ status(); poll(); pending();
 """
 
 
+# ---------------- /file: baixar arquivos do repo atual ----------------
+# Fecha o loop visual: a Muse baixa os renders que o turno gravou no repo.
+# So le, so dentro da raiz do repo atual (REPO_DIR, o que o /switch-repo define),
+# so extensoes de imagem/texto, com teto de tamanho. Mesmo modelo de confianca
+# do resto da ponte: tailnet-only, sem token.
+FILE_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif",
+    ".txt": "text/plain; charset=utf-8", ".md": "text/markdown; charset=utf-8",
+    ".json": "application/json; charset=utf-8", ".log": "text/plain; charset=utf-8",
+}
+FILE_MAX_BYTES = 20 * 1024 * 1024
+
+
+def resolve_repo_file(repo_dir, rel):
+    """-> (http_code, caminho_absoluto | mensagem_de_erro, content_type | None).
+
+    Pura (sem HTTP) para ser testavel. Rejeita caminho absoluto, drive, UNC,
+    ':' (streams NTFS) e NUL; resolve links/junctions com realpath e exige que
+    o alvo fique dentro da raiz resolvida do repo.
+    """
+    if not rel or not isinstance(rel, str):
+        return 400, "parametro path ausente", None
+    if "\x00" in rel:
+        return 400, "path invalido", None
+    if os.path.isabs(rel) or rel.startswith(("/", "\\")) or os.path.splitdrive(rel)[0][:1] in ("\\", "/") \
+            or (len(rel) >= 3 and rel[1] == ":" and rel[2] in "\\/"):
+        return 403, "path deve ser relativo ao repo", None
+    if ":" in rel:  # "C:rel" (relativo a drive) e streams NTFS "a.md:x"
+        return 400, "path invalido", None
+    root = os.path.realpath(repo_dir)
+    full = os.path.realpath(os.path.join(root, rel))
+    nroot, nfull = os.path.normcase(root), os.path.normcase(full)
+    try:
+        inside = os.path.commonpath([nroot, nfull]) == nroot
+    except ValueError:  # drives diferentes
+        inside = False
+    if not inside or nfull == nroot:
+        return 403, "fora da raiz do repo", None
+    ctype = FILE_TYPES.get(os.path.splitext(full)[1].lower())
+    if ctype is None:
+        return 415, "extensao nao servida", None
+    if not os.path.isfile(full):
+        return 404, "arquivo inexistente", None
+    if os.path.getsize(full) > FILE_MAX_BYTES:
+        return 413, "arquivo maior que %d MB" % (FILE_MAX_BYTES // (1024 * 1024)), None
+    return 200, full, ctype
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
+
+    def _file(self, rel):
+        code, target, ctype = resolve_repo_file(REPO_DIR, rel)
+        if code != 200:
+            return self._json({"ok": False, "error": target, "path": rel}, code)
+        try:
+            size = os.path.getsize(target)
+            f = open(target, "rb")
+        except OSError:
+            return self._json({"ok": False, "error": "falha ao ler", "path": rel}, 500)
+        with f:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition",
+                             'inline; filename="%s"' % os.path.basename(target).replace('"', ""))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            while True:
+                chunk = f.read(256 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        log("/file servido: %s (%d bytes)" % (rel, size))
 
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -831,6 +909,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._png(SHOT_PATH)
             return self._json({"ok": False,
                                "error": "falha ao capturar a tela"}, 500)
+
+        if u.path == "/file":
+            return self._file(q.get("path", [""])[0])
 
         if u.path == "/logs":
             try:
